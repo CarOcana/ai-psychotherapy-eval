@@ -4,6 +4,8 @@ import os
 import csv
 import json
 import time
+import re
+import shutil
 from copy import deepcopy
 import pandas as pd
 from tqdm import tqdm
@@ -54,6 +56,9 @@ class Config:
     MI_BEHAVIOR_CODE_MODEL = "gemini-2.5-pro"
     CRISIS_MODEL = "gemini-2.5-pro"
     RUNTIME_CONFIG = None
+    RUNS_DIR = os.path.join(SCRIPT_DIR, "runs")
+    RUN_DIR = LOG_DIR
+    RUN_ID = None
     PAIRINGS_CONFIG = {"mode": "file", "file": PAIRINGS_FILE}
     THERAPISTS_CONFIG = {}
 
@@ -65,7 +70,8 @@ DEFAULT_RUNTIME_CONFIG = {
         "personas_file": "patient_personas.csv",
         "prompt_dir": "prompts",
         "json_schema_dir": "json_schemas",
-        "log_dir": "logs"
+        "log_dir": "logs",
+        "runs_dir": "runs"
     },
     "models": {
         "patient": "gemini-2.5-pro",
@@ -194,7 +200,7 @@ def validate_runtime_config(config):
         errors.append("num_turns_per_session must be >= 1")
 
     paths = config.get("paths", {})
-    for key in ("personas_file", "prompt_dir", "json_schema_dir", "log_dir"):
+    for key in ("personas_file", "prompt_dir", "json_schema_dir", "runs_dir"):
         if not paths.get(key):
             errors.append(f"paths.{key} is required")
 
@@ -258,7 +264,10 @@ def apply_runtime_config(config):
     Config.PATIENT_PERSONAS_FILE = resolve_path(paths["personas_file"])
     Config.PROMPT_DIR = resolve_path(paths["prompt_dir"])
     Config.JSON_SCHEMA_DIR = resolve_path(paths["json_schema_dir"])
-    Config.LOG_DIR = resolve_path(paths["log_dir"])
+    Config.RUNS_DIR = resolve_path(paths["runs_dir"])
+    Config.RUN_DIR = resolve_path(paths.get("run_dir", paths.get("log_dir", "logs")))
+    Config.RUN_ID = config.get("run_id")
+    Config.LOG_DIR = Config.RUN_DIR
     Config.PROMPT_LOG_DIR = os.path.join(Config.LOG_DIR, "prompt_logs")
     Config.STATE_FILE = os.path.join(Config.LOG_DIR, "state.json")
     Config.CONVERSATION_LOG_FILE = os.path.join(Config.LOG_DIR, "conversation_log.csv")
@@ -297,6 +306,118 @@ def write_resolved_config():
     path = os.path.join(Config.LOG_DIR, "run_config_resolved.json")
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(Config.RUNTIME_CONFIG, f, indent=2)
+
+def timestamp_id():
+    return time.strftime("%Y%m%d_%H%M%S")
+
+def sanitize_run_id(value):
+    safe_value = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value).strip())
+    return safe_value.strip("._-")
+
+def get_runs_dir(config):
+    return resolve_path(config.get("paths", {}).get("runs_dir", "runs"))
+
+def get_latest_run_file(runs_dir):
+    return os.path.join(runs_dir, "latest_run.json")
+
+def get_resolved_config_file(run_dir):
+    return os.path.join(run_dir, "run_config_resolved.json")
+
+def load_resolved_run_config(run_dir):
+    return load_json_file(get_resolved_config_file(run_dir))
+
+def count_config_pairings(config):
+    pairings_config = config.get("pairings", {})
+    if pairings_config.get("mode") == "generated":
+        return len(pairings_config.get("patient_ids", [])) * len(pairings_config.get("therapist_ids", []))
+
+    pairings_file = pairings_config.get("file")
+    if not pairings_file:
+        return 0
+    pairings_path = pairings_file if os.path.isabs(pairings_file) else os.path.join(SCRIPT_DIR, pairings_file)
+    try:
+        return len(pd.read_csv(pairings_path))
+    except FileNotFoundError:
+        return 0
+
+def is_run_complete(run_dir):
+    config_path = get_resolved_config_file(run_dir)
+    state_path = os.path.join(run_dir, "state.json")
+    if not os.path.exists(config_path) or not os.path.exists(state_path):
+        return False
+
+    config = load_json_file(config_path)
+    state = load_json_file(state_path)
+    total_pairings = count_config_pairings(config)
+    if total_pairings < 1:
+        return False
+
+    return (
+        state.get("stage_completed") == "report_done"
+        and int(state.get("last_completed_pairing_idx", -1)) >= total_pairings - 1
+        and int(state.get("last_completed_session", 0)) >= int(config.get("num_sessions", 0))
+    )
+
+def read_latest_run_pointer(runs_dir):
+    latest_file = get_latest_run_file(runs_dir)
+    if not os.path.exists(latest_file):
+        return None
+    try:
+        latest_data = load_json_file(latest_file)
+    except ValueError:
+        return None
+    run_dir = latest_data.get("run_dir")
+    if not run_dir:
+        run_id = latest_data.get("run_id")
+        run_dir = os.path.join(runs_dir, run_id) if run_id else None
+    if run_dir and os.path.isdir(run_dir):
+        return run_dir
+    return None
+
+def write_latest_run_pointer(run_dir):
+    os.makedirs(Config.RUNS_DIR, exist_ok=True)
+    with open(get_latest_run_file(Config.RUNS_DIR), 'w', encoding='utf-8') as f:
+        json.dump({"run_id": os.path.basename(run_dir), "run_dir": run_dir}, f, indent=2)
+
+def build_new_run_id(config):
+    run_name = sanitize_run_id(config.get("run_name", ""))
+    current_timestamp = timestamp_id()
+    return f"{run_name}_{current_timestamp}" if run_name else current_timestamp
+
+def attach_run_directory(config, run_dir):
+    resolved_config = deepcopy(config)
+    resolved_config["run_id"] = os.path.basename(run_dir)
+    resolved_config.setdefault("paths", {})["run_dir"] = run_dir
+    resolved_config["paths"]["log_dir"] = run_dir
+    return resolved_config
+
+def prepare_runtime_config(args):
+    candidate_config = build_runtime_config(args)
+    runs_dir = get_runs_dir(candidate_config)
+
+    if args.run_name:
+        explicit_run_dir = os.path.join(runs_dir, args.run_name)
+        if os.path.isdir(explicit_run_dir):
+            resumed_config = load_resolved_run_config(explicit_run_dir)
+            if is_run_complete(explicit_run_dir):
+                print(f"Simulation was already complete for run '{args.run_name}'. Exiting.")
+                exit()
+            print(f"Resuming explicitly requested run: {args.run_name}")
+            return resumed_config
+
+    latest_run_dir = read_latest_run_pointer(runs_dir)
+    if latest_run_dir and os.path.exists(get_resolved_config_file(latest_run_dir)) and not is_run_complete(latest_run_dir):
+        print(f"Resuming latest incomplete run: {os.path.basename(latest_run_dir)}")
+        return load_resolved_run_config(latest_run_dir)
+
+    os.makedirs(runs_dir, exist_ok=True)
+    run_id = build_new_run_id(candidate_config)
+    run_dir = os.path.join(runs_dir, run_id)
+    while os.path.exists(run_dir):
+        time.sleep(1)
+        run_id = build_new_run_id(candidate_config)
+        run_dir = os.path.join(runs_dir, run_id)
+    return attach_run_directory(candidate_config, run_dir)
 
 def load_env_file(path):
     if not os.path.exists(path):
@@ -638,6 +759,7 @@ def initialize_logs():
     os.makedirs(Config.LOG_DIR, exist_ok=True)
     os.makedirs(Config.PROMPT_LOG_DIR, exist_ok=True)
     write_resolved_config()
+    write_latest_run_pointer(Config.LOG_DIR)
     log_files = {
         Config.CONVERSATION_LOG_FILE: CONVERSATION_LOG_HEADERS,
         Config.AFTER_SESSION_REPORT_LOG_FILE: REPORT_LOG_HEADERS,
@@ -984,7 +1106,9 @@ async def run_simulation(config=None):
     if config is not None:
         apply_runtime_config(config)
     elif Config.RUNTIME_CONFIG is None:
-        apply_runtime_config(deepcopy(DEFAULT_RUNTIME_CONFIG))
+        default_config = deepcopy(DEFAULT_RUNTIME_CONFIG)
+        default_run_dir = os.path.join(get_runs_dir(default_config), build_new_run_id(default_config))
+        apply_runtime_config(attach_run_directory(default_config, default_run_dir))
     initialize_logs()
 
     # (This section is correct and remains the same - loading schemas, prompts, etc.)
@@ -1342,7 +1466,7 @@ async def run_simulation(config=None):
 if __name__ == "__main__":
     try:
         load_environment()
-        runtime_config = build_runtime_config()
+        runtime_config = prepare_runtime_config(parse_args())
         asyncio.run(run_simulation(runtime_config))
     except ValueError as e:
         print(e)

@@ -6,7 +6,8 @@
     "personas_file": "patient_personas.csv",
     "prompt_dir": "prompts",
     "json_schema_dir": "json_schemas",
-    "log_dir": "logs"
+    "log_dir": "logs",
+    "runs_dir": "runs"
   },
   "models": {
     "patient": "gemini-2.5-pro",

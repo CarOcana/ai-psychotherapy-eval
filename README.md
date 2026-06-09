@@ -117,6 +117,18 @@ The simulation runner executes the AI psychotherapy sessions and logs the data. 
     python simulation_runner.py --preset original
     ```
 
+    Each execution writes its outputs to an isolated directory under `run_simulation/runs/`.
+    The directory name is built from the run name plus a timestamp, for example
+    `runs/pilot_20260609_153000/`. It contains the CSV logs, `prompt_logs/`,
+    `state.json`, and `run_config_resolved.json`.
+
+    If the latest run is incomplete, the next launch resumes it automatically from
+    its `state.json`. To explicitly resume an older run, pass the exact directory
+    name as `--run-name`:
+    ```bash
+    python simulation_runner.py --run-name pilot_20260609_153000
+    ```
+
     You can override basic execution parameters from the CLI:
     ```bash
     python simulation_runner.py --preset original --run-name pilot --num-sessions 1 --num-turns 8
@@ -172,7 +184,7 @@ The interactive dashboard reads data from Google BigQuery. After running the sim
     ./populate_all_tables.sh
     ```
 
-    This script creates the necessary dataset and tables in BigQuery and uploads the CSV logs from the `logs/` directory.
+    This script creates the necessary dataset and tables in BigQuery and uploads CSV logs from the directory configured in `LOG_DIR`. For new runs, point `LOG_DIR` to the desired `runs/<run_id>/` directory.
 
 ## Running the Interactive Dashboard
 
