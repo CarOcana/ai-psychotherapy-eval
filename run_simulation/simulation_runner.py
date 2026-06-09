@@ -1,8 +1,10 @@
 import asyncio
+import argparse
 import os
 import csv
 import json
 import time
+from copy import deepcopy
 import pandas as pd
 from tqdm import tqdm
 import google.generativeai as genai
@@ -51,6 +53,276 @@ class Config:
     MI_GLOBAL_SCORE_MODEL = "gpt-4o-2024-08-06" 
     MI_BEHAVIOR_CODE_MODEL = "gemini-2.5-pro"
     CRISIS_MODEL = "gemini-2.5-pro"
+    RUNTIME_CONFIG = None
+    PAIRINGS_CONFIG = {"mode": "file", "file": PAIRINGS_FILE}
+    THERAPISTS_CONFIG = {}
+
+DEFAULT_RUNTIME_CONFIG = {
+    "run_name": "original",
+    "num_sessions": 4,
+    "num_turns_per_session": 48,
+    "paths": {
+        "personas_file": "patient_personas.csv",
+        "prompt_dir": "prompts",
+        "json_schema_dir": "json_schemas",
+        "log_dir": "logs"
+    },
+    "models": {
+        "patient": "gemini-2.5-pro",
+        "gpt": "gpt-5-chat-latest",
+        "gemini": "gemini-2.5-flash",
+        "character_ai": "psychologist-blazeman98",
+        "psych_material": "rethinking-drinking-psych-material",
+        "mi_global_score": "gpt-4o-2024-08-06",
+        "mi_behavior_code": "gemini-2.5-pro",
+        "crisis": "gemini-2.5-pro"
+    },
+    "therapists": {
+        "therapist_char": {
+            "client_key": "characterai",
+            "api_type": "characterai",
+            "model_ref": "character_ai",
+            "prompt_file": None
+        },
+        "therapist_gpt_limited": {
+            "client_key": "openai",
+            "api_type": "openai",
+            "model_ref": "gpt",
+            "prompt_file": "limited_prompt.txt"
+        },
+        "therapist_gpt_full": {
+            "client_key": "openai",
+            "api_type": "openai",
+            "model_ref": "gpt",
+            "prompt_file": "ai_therapist_prompt.txt"
+        },
+        "therapist_gemini_full": {
+            "client_key": "gemini",
+            "api_type": "gemini",
+            "model_ref": "gemini",
+            "prompt_file": "ai_therapist_prompt.txt"
+        },
+        "therapist_gemini_harm": {
+            "client_key": "harmful",
+            "api_type": "gemini",
+            "model_ref": "gemini",
+            "prompt_file": "harmful_therapist_prompt.txt"
+        },
+        "therapist_psych_material": {
+            "client_key": "psych_material",
+            "api_type": "psych_material",
+            "model_ref": "psych_material",
+            "prompt_file": None
+        }
+    },
+    "pairings": {
+        "mode": "file",
+        "file": "pairings.csv"
+    }
+}
+
+PRESET_DIR = os.path.join(SCRIPT_DIR, "configs", "presets")
+
+def deep_merge(base, override):
+    result = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+def load_json_file(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Configuration file not found: {path}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON configuration at {path}: {exc}") from exc
+
+def load_preset(name):
+    return load_json_file(os.path.join(PRESET_DIR, f"{name}.json"))
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run AI psychotherapy simulations.")
+    parser.add_argument("--preset", help="Configuration preset name from configs/presets.")
+    parser.add_argument("--config", help="Path to a JSON configuration file.")
+    parser.add_argument("--run-name", help="Name for this simulation run.")
+    parser.add_argument("--num-sessions", type=int, help="Number of sessions per pairing.")
+    parser.add_argument("--num-turns", type=int, help="Number of turns per session.")
+    parser.add_argument("--pairings-file", help="CSV file with pairing_id, therapist_id, patient_id.")
+    parser.add_argument("--personas-file", help="CSV file with patient personas.")
+    return parser.parse_args()
+
+def resolve_path(path):
+    if os.path.isabs(path):
+        return path
+    return os.path.join(SCRIPT_DIR, path)
+
+def apply_cli_overrides(config, args):
+    overrides = {}
+    if args.run_name:
+        overrides["run_name"] = args.run_name
+    if args.num_sessions is not None:
+        overrides["num_sessions"] = args.num_sessions
+    if args.num_turns is not None:
+        overrides["num_turns_per_session"] = args.num_turns
+    if args.personas_file:
+        overrides.setdefault("paths", {})["personas_file"] = os.path.abspath(args.personas_file)
+    if args.pairings_file:
+        overrides["pairings"] = {"mode": "file", "file": os.path.abspath(args.pairings_file)}
+    return deep_merge(config, overrides)
+
+def build_runtime_config(args=None):
+    if args is None:
+        args = parse_args()
+    config = deepcopy(DEFAULT_RUNTIME_CONFIG)
+    if args.preset:
+        config = deep_merge(config, load_preset(args.preset))
+    if args.config:
+        config = deep_merge(config, load_json_file(os.path.abspath(args.config)))
+    config = apply_cli_overrides(config, args)
+    validate_runtime_config(config)
+    return config
+
+def validate_runtime_config(config):
+    errors = []
+    if int(config.get("num_sessions", 0)) < 1:
+        errors.append("num_sessions must be >= 1")
+    if int(config.get("num_turns_per_session", 0)) < 1:
+        errors.append("num_turns_per_session must be >= 1")
+
+    paths = config.get("paths", {})
+    for key in ("personas_file", "prompt_dir", "json_schema_dir", "log_dir"):
+        if not paths.get(key):
+            errors.append(f"paths.{key} is required")
+
+    models = config.get("models", {})
+    therapists = config.get("therapists", {})
+    if not therapists:
+        errors.append("therapists must define at least one therapist")
+    for therapist_id, therapist in therapists.items():
+        model_ref = therapist.get("model_ref")
+        if model_ref not in models:
+            errors.append(f"therapist '{therapist_id}' references unknown model_ref '{model_ref}'")
+        if therapist.get("api_type") not in {"characterai", "gemini", "openai", "psych_material"}:
+            errors.append(f"therapist '{therapist_id}' has unsupported api_type '{therapist.get('api_type')}'")
+
+    pairings = config.get("pairings", {})
+    mode = pairings.get("mode")
+    if mode not in {"file", "generated"}:
+        errors.append("pairings.mode must be 'file' or 'generated'")
+    if mode == "file" and not pairings.get("file"):
+        errors.append("pairings.file is required when pairings.mode is 'file'")
+    if mode == "generated":
+        if not pairings.get("patient_ids"):
+            errors.append("pairings.patient_ids is required when pairings.mode is 'generated'")
+        if not pairings.get("therapist_ids"):
+            errors.append("pairings.therapist_ids is required when pairings.mode is 'generated'")
+        for therapist_id in pairings.get("therapist_ids", []):
+            if therapist_id not in therapists:
+                errors.append(f"pairings.therapist_ids includes unknown therapist '{therapist_id}'")
+
+    if errors:
+        raise ValueError("Invalid runtime configuration:\n- " + "\n- ".join(errors))
+
+def refresh_schema_paths_and_headers():
+    global SCHEMA_PATHS, SURE_LOG_HEADERS, SRS_LOG_HEADERS, WAI_LOG_HEADERS
+    global CRISIS_EVAL_LOG_HEADERS, ACTION_PLAN_EVAL_LOG_HEADERS, MI_GLOBAL_EVAL_LOG_HEADERS
+
+    SCHEMA_PATHS = {
+        "patient": os.path.join(Config.JSON_SCHEMA_DIR, "patient_schema.json"),
+        "report": os.path.join(Config.JSON_SCHEMA_DIR, "after_session_report_schema.json"),
+        "sure": os.path.join(Config.JSON_SCHEMA_DIR, "survey_sure_schema.json"),
+        "srs": os.path.join(Config.JSON_SCHEMA_DIR, "survey_srs_schema.json"),
+        "wai": os.path.join(Config.JSON_SCHEMA_DIR, "survey_wai_schema.json"),
+        "neq": os.path.join(Config.JSON_SCHEMA_DIR, "survey_neq_schema.json"),
+        "crisis": os.path.join(Config.JSON_SCHEMA_DIR, "crisis_schema.json"),
+        "action_plan": os.path.join(Config.JSON_SCHEMA_DIR, "action_plan_schema.json"),
+        "batch_behavior_coding": os.path.join(Config.JSON_SCHEMA_DIR, "mi_batch_behavior_schema.json"),
+        "global_scores": os.path.join(Config.JSON_SCHEMA_DIR, "global_scores_schema.json")
+    }
+    SURE_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["sure"])
+    SRS_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["srs"])
+    WAI_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["wai"])
+    CRISIS_EVAL_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["crisis"], base_keys=["pairing_id", "session_id", "turn"])
+    ACTION_PLAN_EVAL_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["action_plan"], base_keys=["pairing_id", "session_id", "turn"])
+    MI_GLOBAL_EVAL_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["global_scores"])
+
+def apply_runtime_config(config):
+    paths = config["paths"]
+    models = config["models"]
+
+    Config.RUNTIME_CONFIG = config
+    Config.PATIENT_PERSONAS_FILE = resolve_path(paths["personas_file"])
+    Config.PROMPT_DIR = resolve_path(paths["prompt_dir"])
+    Config.JSON_SCHEMA_DIR = resolve_path(paths["json_schema_dir"])
+    Config.LOG_DIR = resolve_path(paths["log_dir"])
+    Config.PROMPT_LOG_DIR = os.path.join(Config.LOG_DIR, "prompt_logs")
+    Config.STATE_FILE = os.path.join(Config.LOG_DIR, "state.json")
+    Config.CONVERSATION_LOG_FILE = os.path.join(Config.LOG_DIR, "conversation_log.csv")
+    Config.AFTER_SESSION_REPORT_LOG_FILE = os.path.join(Config.LOG_DIR, "after_session_reports.csv")
+    Config.SURE_SURVEY_LOG_FILE = os.path.join(Config.LOG_DIR, "survey_sure_logs.csv")
+    Config.SRS_SURVEY_LOG_FILE = os.path.join(Config.LOG_DIR, "survey_srs_logs.csv")
+    Config.WAI_SURVEY_LOG_FILE = os.path.join(Config.LOG_DIR, "survey_wai_logs.csv")
+    Config.NEQ_SURVEY_LOG_FILE = os.path.join(Config.LOG_DIR, "survey_neq_logs.csv")
+    Config.CRISIS_EVAL_LOG_FILE = os.path.join(Config.LOG_DIR, "crisis_eval_logs.csv")
+    Config.ACTION_PLAN_EVAL_LOG_FILE = os.path.join(Config.LOG_DIR, "action_plan_eval_logs.csv")
+    Config.MI_BATCH_BEHAVIOR_EVAL_LOG_FILE = os.path.join(Config.LOG_DIR, "mi_batch_behavior_eval_logs.csv")
+    Config.MI_GLOBAL_EVAL_LOG_FILE = os.path.join(Config.LOG_DIR, "mi_global_eval_logs.csv")
+
+    Config.NUM_SESSIONS = int(config["num_sessions"])
+    Config.NUM_TURNS_PER_SESSION = int(config["num_turns_per_session"])
+    Config.PATIENT_MODEL = models["patient"]
+    Config.GPT_MODEL = models["gpt"]
+    Config.GEMINI_MODEL = models["gemini"]
+    Config.CHARACTER_AI_MODEL = models["character_ai"]
+    Config.CHARACTERAI_ID = models.get("character_ai_id", models["character_ai"])
+    Config.PSYCH_M_MODEL = models["psych_material"]
+    Config.MI_GLOBAL_SCORE_MODEL = models["mi_global_score"]
+    Config.MI_BEHAVIOR_CODE_MODEL = models["mi_behavior_code"]
+    Config.CRISIS_MODEL = models["crisis"]
+    Config.PAIRINGS_CONFIG = config["pairings"]
+    Config.THERAPISTS_CONFIG = config["therapists"]
+
+    if Config.PAIRINGS_CONFIG.get("mode") == "file":
+        Config.PAIRINGS_FILE = resolve_path(Config.PAIRINGS_CONFIG["file"])
+
+    refresh_schema_paths_and_headers()
+
+def write_resolved_config():
+    if not Config.RUNTIME_CONFIG:
+        return
+    path = os.path.join(Config.LOG_DIR, "run_config_resolved.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(Config.RUNTIME_CONFIG, f, indent=2)
+
+def load_env_file(path):
+    if not os.path.exists(path):
+        return
+    with open(path, 'r', encoding='utf-8') as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+def load_environment():
+    load_env_file(os.path.join(SCRIPT_DIR, ".env"))
+    load_env_file(os.path.join(os.getcwd(), ".env"))
+
+def configured_api_key(config_value, env_name):
+    env_value = os.getenv(env_name)
+    if env_value:
+        return env_value
+    if config_value and not str(config_value).startswith("<insert_"):
+        return config_value
+    return None
 
 # --- CONSTANTS & HELPERS ---
 def get_headers_from_schema(schema_path, base_keys=None):
@@ -266,27 +538,71 @@ def load_and_split_psych_material(filepath, num_snippets):
         exit() # Terminate the script
 
 # --- API CLIENT INITIALIZATION ---
-async def initialize_clients():
+def get_required_client_keys(pairings_df, therapists):
+    therapist_ids = set(pairings_df["therapist_id"].astype(str))
+    required = {"patient", "crisis"}
+    has_interactive_therapist = False
+
+    for therapist_id in therapist_ids:
+        therapist_config = therapists[therapist_id]
+        required.add(therapist_config["client_key"])
+        if therapist_config["api_type"] != "psych_material":
+            has_interactive_therapist = True
+
+    if has_interactive_therapist:
+        required.add("batch_behavior_coding")
+        required.add("global_scores")
+
+    return required
+
+async def initialize_clients(pairings_df, therapists):
     try:
-        genai.configure(api_key=Config.GEMINI_API_KEY)
+        required_client_keys = get_required_client_keys(pairings_df, therapists)
+        gemini_api_key = configured_api_key(Config.GEMINI_API_KEY, "GEMINI_API_KEY")
+        openai_api_key = configured_api_key(Config.OPENAI_API_KEY, "OPENAI_API_KEY")
+        characterai_api_key = configured_api_key(Config.CHARACTERAI_API_KEY, "CHARACTERAI_API_KEY")
+
+        gemini_client_keys = {"patient", "harmful", "crisis", "gemini", "batch_behavior_coding"}
+        if required_client_keys & gemini_client_keys:
+            if not gemini_api_key:
+                raise ValueError("GEMINI_API_KEY is required for this configuration.")
+            genai.configure(api_key=gemini_api_key)
+
         safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
-        clients = {
-            'patient': genai.GenerativeModel(Config.PATIENT_MODEL, safety_settings=safety_settings),
-            'harmful': genai.GenerativeModel(Config.GEMINI_MODEL, safety_settings=safety_settings),
-            'crisis': genai.GenerativeModel(Config.CRISIS_MODEL, safety_settings=safety_settings),
-            'gemini': genai.GenerativeModel(Config.GEMINI_MODEL),
-            'openai': OpenAI(api_key=Config.OPENAI_API_KEY),
-            'global_scores': OpenAI(api_key=Config.OPENAI_API_KEY),
-            'batch_behavior_coding': genai.GenerativeModel(Config.MI_BEHAVIOR_CODE_MODEL, safety_settings=safety_settings)
-        }
-        print("Initializing CharacterAI client...")
-        clients['characterai'] = await get_client(token=Config.CHARACTERAI_API_KEY)
-        print("CharacterAI client initialized.")
+
+        clients = {}
+        if "patient" in required_client_keys:
+            clients["patient"] = genai.GenerativeModel(Config.PATIENT_MODEL, safety_settings=safety_settings)
+        if "harmful" in required_client_keys:
+            clients["harmful"] = genai.GenerativeModel(Config.GEMINI_MODEL, safety_settings=safety_settings)
+        if "crisis" in required_client_keys:
+            clients["crisis"] = genai.GenerativeModel(Config.CRISIS_MODEL, safety_settings=safety_settings)
+        if "gemini" in required_client_keys:
+            clients["gemini"] = genai.GenerativeModel(Config.GEMINI_MODEL)
+        if "batch_behavior_coding" in required_client_keys:
+            clients["batch_behavior_coding"] = genai.GenerativeModel(Config.MI_BEHAVIOR_CODE_MODEL, safety_settings=safety_settings)
+        if "openai" in required_client_keys:
+            if not openai_api_key:
+                raise ValueError("OPENAI_API_KEY is required because this run includes an OpenAI therapist.")
+            clients["openai"] = OpenAI(api_key=openai_api_key)
+        if "global_scores" in required_client_keys:
+            if openai_api_key:
+                clients["global_scores"] = OpenAI(api_key=openai_api_key)
+            else:
+                clients["global_scores"] = None
+                tqdm.write("Warning: OPENAI_API_KEY is missing. MI global score evaluation will be skipped.")
+        if "characterai" in required_client_keys:
+            if not characterai_api_key:
+                raise ValueError("CHARACTERAI_API_KEY is required because this run includes a CharacterAI therapist.")
+            print("Initializing CharacterAI client...")
+            clients["characterai"] = await get_client(token=characterai_api_key)
+            print("CharacterAI client initialized.")
+
         print("API clients initialized.")
         return clients
     except Exception as e:
@@ -321,6 +637,7 @@ def save_state(pairing_idx, session_num, turn_num, char_chats, psych_progress, s
 def initialize_logs():
     os.makedirs(Config.LOG_DIR, exist_ok=True)
     os.makedirs(Config.PROMPT_LOG_DIR, exist_ok=True)
+    write_resolved_config()
     log_files = {
         Config.CONVERSATION_LOG_FILE: CONVERSATION_LOG_HEADERS,
         Config.AFTER_SESSION_REPORT_LOG_FILE: REPORT_LOG_HEADERS,
@@ -365,6 +682,51 @@ def load_json_schema(filepath):
         with open(filepath, 'r', encoding='utf-8') as f: return json.load(f)
     except FileNotFoundError: print(f"Error: JSON schema not found at {filepath}"); exit()
     except json.JSONDecodeError: print(f"Error: Invalid JSON in schema file {filepath}"); exit()
+
+def build_therapists():
+    therapists = {}
+    for therapist_id, therapist_config in Config.THERAPISTS_CONFIG.items():
+        prompt_file = therapist_config.get("prompt_file")
+        therapists[therapist_id] = {
+            "client_key": therapist_config["client_key"],
+            "model": Config.RUNTIME_CONFIG["models"][therapist_config["model_ref"]],
+            "prompt": load_prompt(prompt_file) if prompt_file else None,
+            "api_type": therapist_config["api_type"]
+        }
+    return therapists
+
+def load_pairings(personas_df):
+    pairings_config = Config.PAIRINGS_CONFIG
+    required_columns = {"pairing_id", "therapist_id", "patient_id"}
+    persona_ids = set(personas_df["patient_id"].astype(str))
+
+    if pairings_config["mode"] == "file":
+        pairings_df = pd.read_csv(Config.PAIRINGS_FILE)
+        missing_columns = required_columns - set(pairings_df.columns)
+        if missing_columns:
+            raise ValueError(f"Pairings CSV is missing required columns: {sorted(missing_columns)}")
+    else:
+        rows = []
+        pairing_id = int(pairings_config.get("start_pairing_id", 1))
+        for patient_id in pairings_config["patient_ids"]:
+            for therapist_id in pairings_config["therapist_ids"]:
+                rows.append({
+                    "pairing_id": pairing_id,
+                    "therapist_id": therapist_id,
+                    "patient_id": patient_id
+                })
+                pairing_id += 1
+        pairings_df = pd.DataFrame(rows, columns=["pairing_id", "therapist_id", "patient_id"])
+
+    unknown_therapists = sorted(set(pairings_df["therapist_id"].astype(str)) - set(Config.THERAPISTS_CONFIG))
+    if unknown_therapists:
+        raise ValueError(f"Pairings reference unknown therapist_id values: {unknown_therapists}")
+
+    unknown_patients = sorted(set(pairings_df["patient_id"].astype(str)) - persona_ids)
+    if unknown_patients:
+        raise ValueError(f"Pairings reference unknown patient_id values: {unknown_patients}")
+
+    return pairings_df
 
 def log_prompt_to_file(prompt_content: str, pairing_id: int, session_id: int, target_name: str):
     """Saves a given prompt string to a uniquely named text file for debugging."""
@@ -618,9 +980,12 @@ async def run_therapist_turn(clients, therapist_config, history, previous_sessio
         return get_llm_response(clients[therapist_config['client_key']], therapist_config['model'], prompt, therapist_config['api_type'])
 
 # --- MAIN SIMULATION ORCHESTRATOR ---
-async def run_simulation():
+async def run_simulation(config=None):
+    if config is not None:
+        apply_runtime_config(config)
+    elif Config.RUNTIME_CONFIG is None:
+        apply_runtime_config(deepcopy(DEFAULT_RUNTIME_CONFIG))
     initialize_logs()
-    clients = await initialize_clients()
 
     # (This section is correct and remains the same - loading schemas, prompts, etc.)
     schemas = {name: load_json_schema(path) for name, path in SCHEMA_PATHS.items()}
@@ -639,15 +1004,9 @@ async def run_simulation():
     psych_material_snippets = load_and_split_psych_material(psych_edu_path, Config.NUM_SESSIONS * Config.NUM_TURNS_PER_SESSION)
     personas_df = pd.read_csv(Config.PATIENT_PERSONAS_FILE).astype(str)
     personas_map = {p['patient_id']: p for p in personas_df.to_dict('records')}
-    pairings_df = pd.read_csv(Config.PAIRINGS_FILE)
-    therapists = {
-        "therapist_char": {"client_key": "characterai", "model": Config.CHARACTER_AI_MODEL, "prompt": None, "api_type": "characterai"},
-        "therapist_gpt_limited": {"client_key": "openai", "model": Config.GPT_MODEL, "prompt": load_prompt("limited_prompt.txt"), "api_type": "openai"},
-        "therapist_gpt_full": {"client_key": "openai", "model": Config.GPT_MODEL, "prompt": load_prompt("ai_therapist_prompt.txt"), "api_type": "openai"},
-        "therapist_gemini_full": {"client_key": "gemini", "model": Config.GEMINI_MODEL, "prompt": load_prompt("ai_therapist_prompt.txt"), "api_type": "gemini"},
-        "therapist_gemini_harm": {"client_key": "harmful", "model": Config.GEMINI_MODEL, "prompt": load_prompt("harmful_therapist_prompt.txt"), "api_type": "gemini"},
-        "therapist_psych_material": {"client_key": "psych_material", "model": Config.PSYCH_M_MODEL, "prompt": None, "api_type": "psych_material"},
-    }
+    pairings_df = load_pairings(personas_df)
+    therapists = build_therapists()
+    clients = await initialize_clients(pairings_df, therapists)
 
     global characterai_chats, psych_material_progress
     state, characterai_chats, psych_material_progress = load_state()
@@ -882,13 +1241,16 @@ async def run_simulation():
 
                 if current_stage_idx < SESSION_STAGES.index("mi_global_done"):
                     tqdm.write(f"Running MI Global evaluation for session {session_num}...")
-                    global_prompt = prompts['mi_global_eval'].format(current_session_transcript=current_session_transcript, miti_manual=miti_manual_text)
-                    global_scores = get_llm_response(clients['global_scores'], Config.MI_GLOBAL_SCORE_MODEL, global_prompt, 'openai', schemas['global_scores'])
-                    if global_scores:
-                        flat_scores = flatten_nested_dict(global_scores)
-                        log_mi_global_eval({"pairing_id": pairing_id, "session_id": session_num, **flat_scores})
+                    if clients.get('global_scores') is None:
+                        tqdm.write("Skipping MI Global evaluation because OPENAI_API_KEY is not configured.")
                     else:
-                        tqdm.write(f"CRITICAL: Failed to generate MI Global scores. Terminating."); exit()
+                        global_prompt = prompts['mi_global_eval'].format(current_session_transcript=current_session_transcript, miti_manual=miti_manual_text)
+                        global_scores = get_llm_response(clients['global_scores'], Config.MI_GLOBAL_SCORE_MODEL, global_prompt, 'openai', schemas['global_scores'])
+                        if global_scores:
+                            flat_scores = flatten_nested_dict(global_scores)
+                            log_mi_global_eval({"pairing_id": pairing_id, "session_id": session_num, **flat_scores})
+                        else:
+                            tqdm.write(f"CRITICAL: Failed to generate MI Global scores. Terminating."); exit()
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "mi_global_done")
                     current_stage_idx = SESSION_STAGES.index("mi_global_done")
 
@@ -978,4 +1340,10 @@ async def run_simulation():
         save_state(final_pairing_idx, Config.NUM_SESSIONS, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "report_done")
 
 if __name__ == "__main__":
-    asyncio.run(run_simulation())
+    try:
+        load_environment()
+        runtime_config = build_runtime_config()
+        asyncio.run(run_simulation(runtime_config))
+    except ValueError as e:
+        print(e)
+        exit(1)

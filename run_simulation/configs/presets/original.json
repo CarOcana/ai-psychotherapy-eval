@@ -1,0 +1,63 @@
+{
+  "run_name": "original",
+  "num_sessions": 4,
+  "num_turns_per_session": 48,
+  "paths": {
+    "personas_file": "patient_personas.csv",
+    "prompt_dir": "prompts",
+    "json_schema_dir": "json_schemas",
+    "log_dir": "logs"
+  },
+  "models": {
+    "patient": "gemini-2.5-pro",
+    "gpt": "gpt-5-chat-latest",
+    "gemini": "gemini-2.5-flash",
+    "character_ai": "psychologist-blazeman98",
+    "psych_material": "rethinking-drinking-psych-material",
+    "mi_global_score": "gpt-4o-2024-08-06",
+    "mi_behavior_code": "gemini-2.5-pro",
+    "crisis": "gemini-2.5-pro"
+  },
+  "therapists": {
+    "therapist_char": {
+      "client_key": "characterai",
+      "api_type": "characterai",
+      "model_ref": "character_ai",
+      "prompt_file": null
+    },
+    "therapist_gpt_limited": {
+      "client_key": "openai",
+      "api_type": "openai",
+      "model_ref": "gpt",
+      "prompt_file": "limited_prompt.txt"
+    },
+    "therapist_gpt_full": {
+      "client_key": "openai",
+      "api_type": "openai",
+      "model_ref": "gpt",
+      "prompt_file": "ai_therapist_prompt.txt"
+    },
+    "therapist_gemini_full": {
+      "client_key": "gemini",
+      "api_type": "gemini",
+      "model_ref": "gemini",
+      "prompt_file": "ai_therapist_prompt.txt"
+    },
+    "therapist_gemini_harm": {
+      "client_key": "harmful",
+      "api_type": "gemini",
+      "model_ref": "gemini",
+      "prompt_file": "harmful_therapist_prompt.txt"
+    },
+    "therapist_psych_material": {
+      "client_key": "psych_material",
+      "api_type": "psych_material",
+      "model_ref": "psych_material",
+      "prompt_file": null
+    }
+  },
+  "pairings": {
+    "mode": "file",
+    "file": "pairings.csv"
+  }
+}

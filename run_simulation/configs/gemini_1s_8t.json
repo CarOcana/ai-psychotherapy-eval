@@ -1,0 +1,10 @@
+  {
+    "run_name": "gemini_1s_8t",
+    "num_sessions": 1,
+    "num_turns_per_session": 8,
+    "pairings": {
+      "mode": "generated",
+      "patient_ids": [1],
+      "therapist_ids": ["therapist_gemini_full"]
+    }
+  }

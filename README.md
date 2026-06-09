@@ -94,15 +94,51 @@ The simulation runner executes the AI psychotherapy sessions and logs the data. 
     ```
 
 4.  **Configuration**:
-    Open `simulation_runner.py` and update the `Config` class with your API keys:
+    Set the API keys needed by your run as environment variables or in a `.env` file inside `run_simulation/`:
     *   `GEMINI_API_KEY`
     *   `OPENAI_API_KEY`
     *   `CHARACTERAI_API_KEY`
     *   `CHARACTERAI_ID`
 
+    Example `.env` for a Gemini-only pilot:
+    ```bash
+    GEMINI_API_KEY=your_gemini_api_key
+    ```
+
+    API clients are initialized from the selected pairing configuration. For example, a run that only evaluates `therapist_gemini_full` does not require CharacterAI credentials. If `OPENAI_API_KEY` is missing, the optional MI global score evaluation is skipped.
+
 5.  Run the simulation:
     ```bash
     python simulation_runner.py
+    ```
+
+    To run the original experiment through the new preset system:
+    ```bash
+    python simulation_runner.py --preset original
+    ```
+
+    You can override basic execution parameters from the CLI:
+    ```bash
+    python simulation_runner.py --preset original --run-name pilot --num-sessions 1 --num-turns 8
+    ```
+
+    Custom experiment designs can be loaded from JSON:
+    ```bash
+    python simulation_runner.py --config path/to/config.json
+    ```
+
+    A generated pairing configuration can select the therapists and patients to evaluate without editing `pairings.csv`:
+    ```json
+    {
+      "run_name": "pilot_gpt_vs_gemini",
+      "num_sessions": 1,
+      "num_turns_per_session": 8,
+      "pairings": {
+        "mode": "generated",
+        "patient_ids": [1, 2, 3],
+        "therapist_ids": ["therapist_gpt_full", "therapist_gemini_full"]
+      }
+    }
     ```
 
 6.  Deactivate the environment when done:
