@@ -9,6 +9,13 @@
     "log_dir": "logs",
     "runs_dir": "runs"
   },
+  "inference": {
+    "timeout_s": 90,
+    "max_retries": 5,
+    "backoff_s": 5,
+    "backoff_multiplier": 2,
+    "temperature": 1
+  },
   "models": {
     "patient": "gemini-2.5-pro",
     "gpt": "gpt-5-chat-latest",

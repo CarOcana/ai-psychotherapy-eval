@@ -4,3 +4,5 @@ pandas~=2.3.2
 tqdm~=4.67.1
 PyCharacterAI~=2.2.42
 grpcio~=1.60.1 #removes logging warning
+requests>=2.32.0,<3
+jsonschema~=4.23.0

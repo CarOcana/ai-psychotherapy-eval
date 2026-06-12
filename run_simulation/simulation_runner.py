@@ -5,14 +5,21 @@ import csv
 import json
 import time
 import re
-import shutil
+from dataclasses import dataclass
 from copy import deepcopy
 import pandas as pd
+import requests
 from tqdm import tqdm
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
 from openai import OpenAI
 from PyCharacterAI import get_client
+
+try:
+    from jsonschema import validate as validate_json_schema
+except ImportError:
+    def validate_json_schema(instance, schema):
+        validate_json_schema_minimal(instance, schema)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -72,6 +79,13 @@ DEFAULT_RUNTIME_CONFIG = {
         "json_schema_dir": "json_schemas",
         "log_dir": "logs",
         "runs_dir": "runs"
+    },
+    "inference": {
+        "timeout_s": 90,
+        "max_retries": 5,
+        "backoff_s": 5,
+        "backoff_multiplier": 2,
+        "temperature": 1
     },
     "models": {
         "patient": "gemini-2.5-pro",
@@ -212,8 +226,9 @@ def validate_runtime_config(config):
         model_ref = therapist.get("model_ref")
         if model_ref not in models:
             errors.append(f"therapist '{therapist_id}' references unknown model_ref '{model_ref}'")
-        if therapist.get("api_type") not in {"characterai", "gemini", "openai", "psych_material"}:
-            errors.append(f"therapist '{therapist_id}' has unsupported api_type '{therapist.get('api_type')}'")
+        provider = therapist.get("provider") or therapist.get("api_type")
+        if provider not in {"characterai", "gemini", "openai", "ollama", "psych_material"}:
+            errors.append(f"therapist '{therapist_id}' has unsupported provider/api_type '{provider}'")
 
     pairings = config.get("pairings", {})
     mode = pairings.get("mode")
@@ -256,6 +271,11 @@ def refresh_schema_paths_and_headers():
     ACTION_PLAN_EVAL_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["action_plan"], base_keys=["pairing_id", "session_id", "turn"])
     MI_GLOBAL_EVAL_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["global_scores"])
 
+def normalize_model_name(model_value):
+    if isinstance(model_value, dict):
+        return model_value.get("model") or model_value.get("name")
+    return model_value
+
 def apply_runtime_config(config):
     paths = config["paths"]
     models = config["models"]
@@ -283,15 +303,15 @@ def apply_runtime_config(config):
 
     Config.NUM_SESSIONS = int(config["num_sessions"])
     Config.NUM_TURNS_PER_SESSION = int(config["num_turns_per_session"])
-    Config.PATIENT_MODEL = models["patient"]
-    Config.GPT_MODEL = models["gpt"]
-    Config.GEMINI_MODEL = models["gemini"]
-    Config.CHARACTER_AI_MODEL = models["character_ai"]
-    Config.CHARACTERAI_ID = models.get("character_ai_id", models["character_ai"])
-    Config.PSYCH_M_MODEL = models["psych_material"]
-    Config.MI_GLOBAL_SCORE_MODEL = models["mi_global_score"]
-    Config.MI_BEHAVIOR_CODE_MODEL = models["mi_behavior_code"]
-    Config.CRISIS_MODEL = models["crisis"]
+    Config.PATIENT_MODEL = normalize_model_name(models["patient"])
+    Config.GPT_MODEL = normalize_model_name(models["gpt"])
+    Config.GEMINI_MODEL = normalize_model_name(models["gemini"])
+    Config.CHARACTER_AI_MODEL = normalize_model_name(models["character_ai"])
+    Config.CHARACTERAI_ID = normalize_model_name(models.get("character_ai_id", models["character_ai"]))
+    Config.PSYCH_M_MODEL = normalize_model_name(models["psych_material"])
+    Config.MI_GLOBAL_SCORE_MODEL = normalize_model_name(models["mi_global_score"])
+    Config.MI_BEHAVIOR_CODE_MODEL = normalize_model_name(models["mi_behavior_code"])
+    Config.CRISIS_MODEL = normalize_model_name(models["crisis"])
     Config.PAIRINGS_CONFIG = config["pairings"]
     Config.THERAPISTS_CONFIG = config["therapists"]
 
@@ -556,6 +576,33 @@ def sanitize_text(text: str) -> str:
     if not isinstance(text, str): return ""
     return " ".join(text.split()).strip()
 
+def validate_json_schema_minimal(instance, schema, path="root"):
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        if not isinstance(instance, dict):
+            raise ValueError(f"{path} must be an object")
+        for key in schema.get("required", []):
+            if key not in instance:
+                raise ValueError(f"{path}.{key} is required")
+        for key, child_schema in schema.get("properties", {}).items():
+            if key in instance:
+                validate_json_schema_minimal(instance[key], child_schema, f"{path}.{key}")
+    elif schema_type == "array":
+        if not isinstance(instance, list):
+            raise ValueError(f"{path} must be an array")
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(instance):
+                validate_json_schema_minimal(item, item_schema, f"{path}[{index}]")
+    elif schema_type == "string" and not isinstance(instance, str):
+        raise ValueError(f"{path} must be a string")
+    elif schema_type == "integer" and not isinstance(instance, int):
+        raise ValueError(f"{path} must be an integer")
+    elif schema_type == "number" and not isinstance(instance, (int, float)):
+        raise ValueError(f"{path} must be a number")
+    elif schema_type == "boolean" and not isinstance(instance, bool):
+        raise ValueError(f"{path} must be a boolean")
+
 def flatten_nested_dict(d, parent_key='', sep='_'):
     """Flattens a nested dictionary for CSV logging."""
     items = []
@@ -658,71 +705,350 @@ def load_and_split_psych_material(filepath, num_snippets):
         tqdm.write(f"ERROR: Psychoeducation file not found at {filepath}. This condition will fail.")
         exit() # Terminate the script
 
-# --- API CLIENT INITIALIZATION ---
-def get_required_client_keys(pairings_df, therapists):
+# --- INFERENCE LAYER ---
+@dataclass
+class InferenceResult:
+    text: str = None
+    json: dict = None
+    raw: object = None
+    provider: str = None
+    model: str = None
+    attempts: int = 0
+
+@dataclass
+class ModelSpec:
+    name: str
+    provider: str
+    model: str
+    api_key_env: str = None
+    base_url: str = None
+    timeout_s: int = None
+    max_retries: int = None
+    backoff_s: int = None
+    backoff_multiplier: int = None
+    temperature: float = None
+    json_mode: str = "schema"
+    character_id: str = None
+    safety_settings: bool = True
+
+class InferenceClient:
+    def __init__(self, spec, policy, role):
+        self.spec = spec
+        self.policy = policy
+        self.role = role
+
+    @property
+    def timeout_s(self):
+        return self.spec.timeout_s or self.policy["timeout_s"]
+
+    @property
+    def max_retries(self):
+        return self.spec.max_retries or self.policy["max_retries"]
+
+    @property
+    def backoff_s(self):
+        return self.spec.backoff_s or self.policy["backoff_s"]
+
+    @property
+    def backoff_multiplier(self):
+        return self.spec.backoff_multiplier or self.policy["backoff_multiplier"]
+
+    @property
+    def temperature(self):
+        return self.spec.temperature if self.spec.temperature is not None else self.policy["temperature"]
+
+    async def generate(self, prompt, schema=None, context=None):
+        delay = self.backoff_s
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                raw = await self._call_with_timeout(prompt, schema, context or {})
+                result = self._prepare_result(raw, schema, attempt)
+                return result
+            except Exception as e:
+                last_error = e
+                tqdm.write(
+                    f"Inference failed for role={self.role}, provider={self.spec.provider}, "
+                    f"model={self.spec.model}, attempt={attempt}/{self.max_retries}: {type(e).__name__}: {e}"
+                )
+                if attempt < self.max_retries:
+                    await asyncio.sleep(delay)
+                    delay *= self.backoff_multiplier
+
+        tqdm.write(
+            f"CRITICAL: Aborting LLM call after {self.max_retries} attempts "
+            f"(role={self.role}, provider={self.spec.provider}, model={self.spec.model}). "
+            f"Last error: {type(last_error).__name__}: {last_error}"
+        )
+        return None
+
+    async def _call_with_timeout(self, prompt, schema, context):
+        return await asyncio.wait_for(self._call_once(prompt, schema, context), timeout=self.timeout_s + 5)
+
+    async def _call_once(self, prompt, schema, context):
+        raise NotImplementedError
+
+    def _prepare_result(self, raw, schema, attempt):
+        text = raw if isinstance(raw, str) else raw.get("text", "")
+        parsed_json = None
+        if schema:
+            parsed_json = raw.get("json") if isinstance(raw, dict) and "json" in raw else parse_json_response(text)
+            validate_json_schema(parsed_json, schema)
+        return InferenceResult(
+            text=text,
+            json=parsed_json,
+            raw=raw,
+            provider=self.spec.provider,
+            model=self.spec.model,
+            attempts=attempt
+        )
+
+def parse_json_response(text):
+    if isinstance(text, dict):
+        return text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text or "", flags=re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+class GeminiInferenceClient(InferenceClient):
+    def __init__(self, spec, policy, role):
+        super().__init__(spec, policy, role)
+        safety_settings = None
+        if spec.safety_settings:
+            safety_settings = {
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            }
+        self.client = genai.GenerativeModel(spec.model, safety_settings=safety_settings)
+
+    async def _call_once(self, prompt, schema, context):
+        def call():
+            config_args = {"temperature": self.temperature}
+            if schema:
+                config_args["response_mime_type"] = "application/json"
+                config_args["response_schema"] = schema
+            response = self.client.generate_content(
+                prompt,
+                generation_config=GenerationConfig(**config_args),
+                request_options={"timeout": self.timeout_s, "retry": None}
+            )
+            return response.text
+        return await asyncio.to_thread(call)
+
+class OpenAIInferenceClient(InferenceClient):
+    def __init__(self, spec, policy, role, api_key):
+        super().__init__(spec, policy, role)
+        self.client = OpenAI(api_key=api_key, timeout=self.timeout_s, max_retries=0)
+
+    async def _call_once(self, prompt, schema, context):
+        def call():
+            api_args = {
+                "model": self.spec.model,
+                "temperature": self.temperature,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            if schema:
+                api_args["response_format"] = {"type": "json_object"}
+            return self.client.chat.completions.create(**api_args).choices[0].message.content
+        return await asyncio.to_thread(call)
+
+class OllamaInferenceClient(InferenceClient):
+    async def _call_once(self, prompt, schema, context):
+        def call():
+            payload = {
+                "model": self.spec.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"temperature": self.temperature}
+            }
+            if schema and self.spec.json_mode == "schema":
+                payload["format"] = schema
+            elif schema:
+                payload["format"] = "json"
+            response = requests.post(
+                f"{self.spec.base_url.rstrip('/')}/api/chat",
+                json=payload,
+                timeout=self.timeout_s
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("message", {}).get("content", "")
+        return await asyncio.to_thread(call)
+
+class CharacterAIInferenceClient(InferenceClient):
+    def __init__(self, spec, policy, role, client):
+        super().__init__(spec, policy, role)
+        self.client = client
+
+    async def _call_once(self, prompt, schema, context):
+        pairing_key = str(context.get("pairing_id", "default"))
+        if pairing_key not in characterai_chats:
+            tqdm.write(f"Creating new CharacterAI chat for pairing: {pairing_key}")
+            chat, _ = await asyncio.wait_for(
+                self.client.chat.create_chat(self.spec.character_id),
+                timeout=self.timeout_s
+            )
+            characterai_chats[pairing_key] = chat.chat_id
+        chat_id = characterai_chats[pairing_key]
+        answer = await asyncio.wait_for(
+            self.client.chat.send_message(self.spec.character_id, chat_id, prompt),
+            timeout=self.timeout_s
+        )
+        return answer.get_primary_candidate().text
+
+class StaticMaterialInferenceClient(InferenceClient):
+    def __init__(self, spec, policy, role, snippets):
+        super().__init__(spec, policy, role)
+        self.snippets = snippets
+
+    async def generate(self, prompt, schema=None, context=None):
+        pairing_key = str(context.get("pairing_id", "default") if context else "default")
+        current_index = psych_material_progress.get(pairing_key, 0)
+        if current_index >= len(self.snippets):
+            text = "You have reached the end of the educational material."
+        else:
+            text = self.snippets[current_index]
+            psych_material_progress[pairing_key] = current_index + 1
+        return InferenceResult(text=text, provider=self.spec.provider, model=self.spec.model, attempts=1)
+
+def get_inference_policy():
+    policy = deepcopy(DEFAULT_RUNTIME_CONFIG["inference"])
+    policy.update(Config.RUNTIME_CONFIG.get("inference", {}))
+    return policy
+
+def infer_provider(model_ref, model_value):
+    if isinstance(model_value, dict) and model_value.get("provider"):
+        return model_value["provider"]
+    if model_ref in {"gpt", "mi_global_score"}:
+        return "openai"
+    if model_ref == "character_ai":
+        return "characterai"
+    if model_ref == "psych_material":
+        return "psych_material"
+    return "gemini"
+
+def normalize_model_spec(model_ref):
+    model_value = Config.RUNTIME_CONFIG["models"][model_ref]
+    if isinstance(model_value, dict):
+        provider = infer_provider(model_ref, model_value)
+        model_name = model_value.get("model") or model_value.get("name")
+        spec_data = deepcopy(model_value)
+    else:
+        provider = infer_provider(model_ref, model_value)
+        model_name = model_value
+        spec_data = {}
+
+    default_env = {
+        "gemini": "GEMINI_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "characterai": "CHARACTERAI_API_KEY"
+    }.get(provider)
+
+    return ModelSpec(
+        name=model_ref,
+        provider=provider,
+        model=model_name,
+        api_key_env=spec_data.get("api_key_env", default_env),
+        base_url=spec_data.get("base_url", "http://localhost:11434"),
+        timeout_s=spec_data.get("timeout_s"),
+        max_retries=spec_data.get("max_retries"),
+        backoff_s=spec_data.get("backoff_s"),
+        backoff_multiplier=spec_data.get("backoff_multiplier"),
+        temperature=spec_data.get("temperature"),
+        json_mode=spec_data.get("json_mode", "schema"),
+        character_id=spec_data.get("character_id", Config.CHARACTERAI_ID if model_ref == "character_ai" else (model_name if provider == "characterai" else None)),
+        safety_settings=spec_data.get("safety_settings", True)
+    )
+
+async def create_inference_client(model_ref, role, psych_material_snippets=None, characterai_base_client=None):
+    spec = normalize_model_spec(model_ref)
+    policy = get_inference_policy()
+
+    if spec.provider == "gemini":
+        api_key = configured_api_key(Config.GEMINI_API_KEY, spec.api_key_env)
+        if not api_key:
+            raise ValueError(f"{spec.api_key_env} is required for role '{role}'.")
+        genai.configure(api_key=api_key)
+        return GeminiInferenceClient(spec, policy, role)
+    if spec.provider == "openai":
+        api_key = configured_api_key(Config.OPENAI_API_KEY, spec.api_key_env)
+        if not api_key:
+            raise ValueError(f"{spec.api_key_env} is required for role '{role}'.")
+        return OpenAIInferenceClient(spec, policy, role, api_key)
+    if spec.provider == "ollama":
+        return OllamaInferenceClient(spec, policy, role)
+    if spec.provider == "characterai":
+        if characterai_base_client is None:
+            api_key = configured_api_key(Config.CHARACTERAI_API_KEY, spec.api_key_env)
+            if not api_key:
+                raise ValueError(f"{spec.api_key_env} is required for role '{role}'.")
+            characterai_base_client = await get_client(token=api_key)
+        return CharacterAIInferenceClient(spec, policy, role, characterai_base_client)
+    if spec.provider == "psych_material":
+        return StaticMaterialInferenceClient(spec, policy, role, psych_material_snippets or [])
+    raise ValueError(f"Unsupported inference provider '{spec.provider}' for role '{role}'.")
+
+def get_required_model_refs(pairings_df, therapists):
     therapist_ids = set(pairings_df["therapist_id"].astype(str))
     required = {"patient", "crisis"}
     has_interactive_therapist = False
 
     for therapist_id in therapist_ids:
         therapist_config = therapists[therapist_id]
-        required.add(therapist_config["client_key"])
-        if therapist_config["api_type"] != "psych_material":
+        required.add(therapist_config["model_ref"])
+        if therapist_config["provider"] != "psych_material":
             has_interactive_therapist = True
 
     if has_interactive_therapist:
-        required.add("batch_behavior_coding")
-        required.add("global_scores")
+        required.add("mi_behavior_code")
+        required.add("mi_global_score")
 
     return required
 
-async def initialize_clients(pairings_df, therapists):
+async def initialize_clients(pairings_df, therapists, psych_material_snippets):
     try:
-        required_client_keys = get_required_client_keys(pairings_df, therapists)
-        gemini_api_key = configured_api_key(Config.GEMINI_API_KEY, "GEMINI_API_KEY")
-        openai_api_key = configured_api_key(Config.OPENAI_API_KEY, "OPENAI_API_KEY")
-        characterai_api_key = configured_api_key(Config.CHARACTERAI_API_KEY, "CHARACTERAI_API_KEY")
-
-        gemini_client_keys = {"patient", "harmful", "crisis", "gemini", "batch_behavior_coding"}
-        if required_client_keys & gemini_client_keys:
-            if not gemini_api_key:
-                raise ValueError("GEMINI_API_KEY is required for this configuration.")
-            genai.configure(api_key=gemini_api_key)
-
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
-
         clients = {}
-        if "patient" in required_client_keys:
-            clients["patient"] = genai.GenerativeModel(Config.PATIENT_MODEL, safety_settings=safety_settings)
-        if "harmful" in required_client_keys:
-            clients["harmful"] = genai.GenerativeModel(Config.GEMINI_MODEL, safety_settings=safety_settings)
-        if "crisis" in required_client_keys:
-            clients["crisis"] = genai.GenerativeModel(Config.CRISIS_MODEL, safety_settings=safety_settings)
-        if "gemini" in required_client_keys:
-            clients["gemini"] = genai.GenerativeModel(Config.GEMINI_MODEL)
-        if "batch_behavior_coding" in required_client_keys:
-            clients["batch_behavior_coding"] = genai.GenerativeModel(Config.MI_BEHAVIOR_CODE_MODEL, safety_settings=safety_settings)
-        if "openai" in required_client_keys:
-            if not openai_api_key:
-                raise ValueError("OPENAI_API_KEY is required because this run includes an OpenAI therapist.")
-            clients["openai"] = OpenAI(api_key=openai_api_key)
-        if "global_scores" in required_client_keys:
-            if openai_api_key:
-                clients["global_scores"] = OpenAI(api_key=openai_api_key)
+        required_model_refs = get_required_model_refs(pairings_df, therapists)
+        characterai_base_client = None
+
+        if any(normalize_model_spec(model_ref).provider == "characterai" for model_ref in required_model_refs):
+            characterai_api_key = configured_api_key(Config.CHARACTERAI_API_KEY, "CHARACTERAI_API_KEY")
+            if not characterai_api_key:
+                raise ValueError("CHARACTERAI_API_KEY is required because this run includes a CharacterAI role.")
+            print("Initializing CharacterAI client...")
+            characterai_base_client = await get_client(token=characterai_api_key)
+            print("CharacterAI client initialized.")
+
+        clients["patient"] = await create_inference_client("patient", "patient", psych_material_snippets, characterai_base_client)
+        clients["crisis"] = await create_inference_client("crisis", "crisis", psych_material_snippets, characterai_base_client)
+
+        has_interactive_therapist = any(
+            therapists[therapist_id]["provider"] != "psych_material"
+            for therapist_id in set(pairings_df["therapist_id"].astype(str))
+        )
+        if has_interactive_therapist:
+            clients["batch_behavior_coding"] = await create_inference_client("mi_behavior_code", "batch_behavior_coding", psych_material_snippets, characterai_base_client)
+            mi_global_spec = normalize_model_spec("mi_global_score")
+            mi_global_key = configured_api_key(Config.OPENAI_API_KEY, mi_global_spec.api_key_env) if mi_global_spec.provider == "openai" else True
+            if mi_global_key:
+                clients["global_scores"] = await create_inference_client("mi_global_score", "global_scores", psych_material_snippets, characterai_base_client)
             else:
                 clients["global_scores"] = None
-                tqdm.write("Warning: OPENAI_API_KEY is missing. MI global score evaluation will be skipped.")
-        if "characterai" in required_client_keys:
-            if not characterai_api_key:
-                raise ValueError("CHARACTERAI_API_KEY is required because this run includes a CharacterAI therapist.")
-            print("Initializing CharacterAI client...")
-            clients["characterai"] = await get_client(token=characterai_api_key)
-            print("CharacterAI client initialized.")
+                tqdm.write("Warning: MI global score evaluator credentials are missing. MI global score evaluation will be skipped.")
+
+        for therapist_id in set(pairings_df["therapist_id"].astype(str)):
+            clients[therapist_id] = await create_inference_client(
+                therapists[therapist_id]["model_ref"],
+                therapist_id,
+                psych_material_snippets,
+                characterai_base_client
+            )
 
         print("API clients initialized.")
         return clients
@@ -809,11 +1135,16 @@ def build_therapists():
     therapists = {}
     for therapist_id, therapist_config in Config.THERAPISTS_CONFIG.items():
         prompt_file = therapist_config.get("prompt_file")
+        model_ref = therapist_config["model_ref"]
+        provider = therapist_config.get("provider") or therapist_config.get("api_type") or normalize_model_spec(model_ref).provider
         therapists[therapist_id] = {
-            "client_key": therapist_config["client_key"],
-            "model": Config.RUNTIME_CONFIG["models"][therapist_config["model_ref"]],
+            "therapist_id": therapist_id,
+            "client_key": therapist_config.get("client_key", therapist_id),
+            "model_ref": model_ref,
+            "model": normalize_model_spec(model_ref).model,
             "prompt": load_prompt(prompt_file) if prompt_file else None,
-            "api_type": therapist_config["api_type"]
+            "api_type": provider,
+            "provider": provider
         }
     return therapists
 
@@ -867,52 +1198,13 @@ def log_prompt_to_file(prompt_content: str, pairing_id: int, session_id: int, ta
         tqdm.write(f"Warning: Could not write prompt log for {target_name}. Error: {e}")
 
 # --- API INTERACTION ---
-def get_llm_response(client, model_name, prompt, api_type='gemini', schema=None):
-    for attempt in range(3):
-        try:
-            if api_type == 'gemini':
-                config_args = {"temperature": 1}
-                if schema:
-                    config_args["response_mime_type"] = "application/json"
-                    config_args["response_schema"] = schema
-                config = GenerationConfig(**config_args)
-                response = client.generate_content(prompt, generation_config=config)
-                return json.loads(response.text) if schema else response.text
-            elif api_type == 'openai':
-                # Prepare arguments for the API call
-                api_args = {
-                    "model": model_name,
-                    "temperature": 1,
-                    "messages": [{"role": "user", "content": prompt}]
-                }
-                # If a schema is expected, enforce JSON output mode
-                if schema:
-                    api_args["response_format"] = {"type": "json_object"}
-
-                response = client.chat.completions.create(**api_args).choices[0].message.content
-                return json.loads(response) if schema else response
-        except Exception as e:
-            tqdm.write(f"API call/parsing failed on attempt {attempt + 1} for model {model_name}: {e}")
-            if attempt < 2: time.sleep(5)
-            else: return None
-    return None
-
-async def run_characterai_turn(client, pairing_id, patient_message):
-    for attempt in range(3):
-        try:
-            pairing_key = str(pairing_id)
-            if pairing_key not in characterai_chats:
-                tqdm.write(f"Creating new CharacterAI chat for pairing: {pairing_key}")
-                chat, _ = await client.chat.create_chat(Config.CHARACTERAI_ID)
-                characterai_chats[pairing_key] = chat.chat_id
-            chat_id = characterai_chats[pairing_key]
-            answer = await client.chat.send_message(Config.CHARACTERAI_ID, chat_id, patient_message)
-            return answer.get_primary_candidate().text
-        except Exception as e:
-            tqdm.write(f"CharacterAI API call failed on attempt {attempt + 1}: {e}")
-            if attempt < 2: await asyncio.sleep(5)
-            else: return None
-    return None
+async def get_llm_response(client, prompt, schema=None, context=None):
+    if client is None:
+        return None
+    result = await client.generate(prompt, schema=schema, context=context or {})
+    if not result:
+        return None
+    return result.json if schema else result.text
 
 # --- TRANSCRIPT & JOURNALING LOGIC ---
 def get_session_transcript(pairing_id, session_id, therapist_id):
@@ -970,7 +1262,7 @@ def load_journaling_entries(pairing_id, current_session_num):
         return "Error loading journaling entries."
 
 # --- SIMULATION CORE LOGIC ---
-def generate_and_log_survey(client, prompt_template, schema, log_function, persona_data, psych_state, prev_transcripts, prev_journaling, current_session_transcript, pairing_id, session_id):
+async def generate_and_log_survey(client, prompt_template, schema, log_function, persona_data, psych_state, prev_transcripts, prev_journaling, current_session_transcript, pairing_id, session_id):
     target_name = log_function.__name__.replace('log_', '')
     tqdm.write(f"Preparing to generate survey: {target_name}...")
     prompt_context = {
@@ -986,10 +1278,10 @@ def generate_and_log_survey(client, prompt_template, schema, log_function, perso
         neq_success = False
         for attempt in range(5):
             tqdm.write(f"Generating and validating NEQ survey, attempt {attempt + 1}/5...")
-            response = get_llm_response(client, Config.PATIENT_MODEL, prompt, 'gemini', schema)
+            response = await get_llm_response(client, prompt, schema)
             if not response:
                 tqdm.write(f"Attempt {attempt + 1}/5: Failed to get any response from LLM for NEQ survey.")
-                if attempt < 4: time.sleep(5)
+                if attempt < 4: await asyncio.sleep(5)
                 continue
             flat_response = flatten_neq_response(response)
             expected_keys = {f"question{i}_{field}" for i in range(1, 33) for field in ["experienced", "severity", "cause"]}
@@ -1001,12 +1293,12 @@ def generate_and_log_survey(client, prompt_template, schema, log_function, perso
                 break
             else:
                 tqdm.write(f"CRITICAL: NEQ validation failed on attempt {attempt + 1}/5.")
-                if attempt < 4: time.sleep(5)
+                if attempt < 4: await asyncio.sleep(5)
         if not neq_success:
             tqdm.write("NEQ generation and validation failed after 5 attempts. Terminating simulation.")
             return False
     else:
-        response = get_llm_response(client, Config.PATIENT_MODEL, prompt, 'gemini', schema)
+        response = await get_llm_response(client, prompt, schema)
         if not response:
             tqdm.write(f"Failed to get any response from LLM for {target_name} survey. Terminating to allow for retry.")
             return False
@@ -1016,7 +1308,7 @@ def generate_and_log_survey(client, prompt_template, schema, log_function, perso
     tqdm.write(f"Survey '{target_name}' generated and logged successfully.")
     return True
 
-def generate_after_session_report(clients, persona_data, pairing_id, session_id, current_psych_state, previous_session_transcripts, previous_journaling, current_session_transcript, report_schema, prompt_template):    
+async def generate_after_session_report(clients, persona_data, pairing_id, session_id, current_psych_state, previous_session_transcripts, previous_journaling, current_session_transcript, report_schema, prompt_template):    
     tqdm.write("Generating after-session report...")
     
     prompt_context = {
@@ -1031,7 +1323,7 @@ def generate_after_session_report(clients, persona_data, pairing_id, session_id,
 
     log_prompt_to_file(patient_prompt, pairing_id, session_id, "after_session_report")
     
-    report = get_llm_response(clients['patient'], Config.PATIENT_MODEL, patient_prompt, 'gemini', schema=report_schema)
+    report = await get_llm_response(clients['patient'], patient_prompt, schema=report_schema)
     if not report:
         tqdm.write("After-session report could not be generated.")
         return None
@@ -1053,7 +1345,7 @@ def generate_after_session_report(clients, persona_data, pairing_id, session_id,
     tqdm.write(f"After-session report for session {session_id} generated and logged.")
     return report
 
-def run_patient_turn(patient_client, persona_data, history, therapist_message, current_psych_state, patient_schema, previous_session_transcripts, previous_journaling, prompt_template, pairing_id, session_id, turn_num, therapist_id):    
+async def run_patient_turn(patient_client, persona_data, history, therapist_message, current_psych_state, patient_schema, previous_session_transcripts, previous_journaling, prompt_template, pairing_id, session_id, turn_num, therapist_id):    
     # Determine the correct label
     therapist_label = "Psychoeducation Material Fragment" if therapist_id == 'therapist_psych_material' else "Therapist"
 
@@ -1072,7 +1364,7 @@ def run_patient_turn(patient_client, persona_data, history, therapist_message, c
 
     log_prompt_to_file(patient_prompt, pairing_id, session_id, f"patient_turn_{turn_num}")
 
-    response_json = get_llm_response(patient_client, Config.PATIENT_MODEL, patient_prompt, api_type='gemini', schema=patient_schema)
+    response_json = await get_llm_response(patient_client, patient_prompt, schema=patient_schema)
     if not response_json or "chain_of_thought" not in response_json:
         tqdm.write(f"CRITICAL: Failed to generate a valid patient response for turn {turn_num}.")
         return None
@@ -1082,16 +1374,11 @@ async def run_therapist_turn(clients, therapist_config, history, previous_sessio
     patient_last_message = "The session is just beginning. Please provide a welcoming opening line."
     if history and history[-1]['role'] == 'Patient':
         patient_last_message = history[-1]['content']
-    if therapist_config['api_type'] == 'characterai':
-        return await run_characterai_turn(clients['characterai'], pairing_id, patient_last_message)
-    elif therapist_config['api_type'] == 'psych_material':
-        pairing_key = str(pairing_id)
-        current_index = psych_material_progress.get(pairing_key, 0)
-        if current_index >= len(psych_material_snippets):
-            return "You have reached the end of the educational material."
-        snippet = psych_material_snippets[current_index]
-        psych_material_progress[pairing_key] = current_index + 1
-        return snippet
+    if therapist_config['api_type'] == 'psych_material':
+        result = await clients[therapist_config["therapist_id"]].generate("", context={"pairing_id": pairing_id})
+        return result.text if result else None
+    elif therapist_config['api_type'] == 'characterai':
+        return await get_llm_response(clients[therapist_config["therapist_id"]], patient_last_message, context={"pairing_id": pairing_id})
     else:
         current_session_transcript = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
         prompt = therapist_config['prompt'].format(
@@ -1099,7 +1386,7 @@ async def run_therapist_turn(clients, therapist_config, history, previous_sessio
             current_session_transcript=current_session_transcript, patient_last_message=patient_last_message
         )
         log_prompt_to_file(prompt, pairing_id, session_id, f"therapist_{therapist_config['client_key']}_turn_{turn_num}")
-        return get_llm_response(clients[therapist_config['client_key']], therapist_config['model'], prompt, therapist_config['api_type'])
+        return await get_llm_response(clients[therapist_config["therapist_id"]], prompt)
 
 # --- MAIN SIMULATION ORCHESTRATOR ---
 async def run_simulation(config=None):
@@ -1130,7 +1417,7 @@ async def run_simulation(config=None):
     personas_map = {p['patient_id']: p for p in personas_df.to_dict('records')}
     pairings_df = load_pairings(personas_df)
     therapists = build_therapists()
-    clients = await initialize_clients(pairings_df, therapists)
+    clients = await initialize_clients(pairings_df, therapists, psych_material_snippets)
 
     global characterai_chats, psych_material_progress
     state, characterai_chats, psych_material_progress = load_state()
@@ -1197,7 +1484,7 @@ async def run_simulation(config=None):
                 else:
                     sure_prompt_to_use = prompts['sure']
 
-                success = generate_and_log_survey(
+                success = await generate_and_log_survey(
                     clients['patient'],
                     sure_prompt_to_use,
                     schemas['sure'],
@@ -1261,7 +1548,7 @@ async def run_simulation(config=None):
                         history.append({"role": "Patient", "content": patient_response})
                         log_conversation_turn({"pairing_id": pairing_id, "session_id": session_num, "turn": turn_num, "speaker": "Patient", "message": patient_response, "session_conclusion": session_concluded_by_patient, **current_psych_state})                        
                     else:
-                        patient_output = run_patient_turn(clients['patient'], persona_data, history, therapist_response, current_psych_state, schemas['patient'], previous_session_transcripts, patient_journaling_entries, current_patient_prompt, pairing_id, session_num, turn_num, pairing_info['therapist_id'])
+                        patient_output = await run_patient_turn(clients['patient'], persona_data, history, therapist_response, current_psych_state, schemas['patient'], previous_session_transcripts, patient_journaling_entries, current_patient_prompt, pairing_id, session_num, turn_num, pairing_info['therapist_id'])
                         if not patient_output:
                             tqdm.write("CRITICAL: Patient turn failed. Terminating simulation.")
                             exit()
@@ -1286,7 +1573,7 @@ async def run_simulation(config=None):
                         patient_latest_message=patient_response
                     )
                     log_prompt_to_file(crisis_prompt, pairing_id, session_num, f"crisis_eval_turn_{turn_num}")
-                    crisis_info = get_llm_response(clients['crisis'], Config.CRISIS_MODEL, crisis_prompt, 'gemini', schemas['crisis'])
+                    crisis_info = await get_llm_response(clients['crisis'], crisis_prompt, schemas['crisis'])
                     
                     if not crisis_info:
                         tqdm.write(f"CRITICAL: Crisis evaluation failed for turn {turn_num}. Terminating.")
@@ -1327,7 +1614,7 @@ async def run_simulation(config=None):
                         transcript_for_action = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-2:]])
                         action_plan_prompt = prompts['action_plan_eval'].format(crisis_category=crisis_info['classification'], last_two_responses=transcript_for_action, action_plan_text=action_plan_text)
                         log_prompt_to_file(action_plan_prompt, pairing_id, session_num, f"action_plan_eval_turn_{turn_num}")
-                        action_plan_info = get_llm_response(clients['crisis'], Config.CRISIS_MODEL, action_plan_prompt, 'gemini', schemas['action_plan'])
+                        action_plan_info = await get_llm_response(clients['crisis'], action_plan_prompt, schemas['action_plan'])
                         if not action_plan_info:
                             tqdm.write(f"CRITICAL: Action plan evaluation failed for turn {turn_num}. Terminating.")
                             exit()
@@ -1353,7 +1640,7 @@ async def run_simulation(config=None):
                 if current_stage_idx < SESSION_STAGES.index("mi_batch_behavior_done"):
                     tqdm.write(f"Running MI Batch Behavior Coding for session {session_num}...")
                     batch_prompt = prompts['mi_batch_behavior_eval'].format(current_session_transcript=current_session_transcript, miti_manual=miti_manual_text)
-                    batch_codes = get_llm_response(clients['batch_behavior_coding'], Config.MI_BEHAVIOR_CODE_MODEL, batch_prompt, 'gemini', schemas['batch_behavior_coding'])
+                    batch_codes = await get_llm_response(clients['batch_behavior_coding'], batch_prompt, schemas['batch_behavior_coding'])
                     log_data = calculate_and_prepare_mi_metrics(batch_codes, pairing_id, session_num)
                     if log_data:
                         log_mi_batch_behavior_eval(log_data)
@@ -1369,7 +1656,7 @@ async def run_simulation(config=None):
                         tqdm.write("Skipping MI Global evaluation because OPENAI_API_KEY is not configured.")
                     else:
                         global_prompt = prompts['mi_global_eval'].format(current_session_transcript=current_session_transcript, miti_manual=miti_manual_text)
-                        global_scores = get_llm_response(clients['global_scores'], Config.MI_GLOBAL_SCORE_MODEL, global_prompt, 'openai', schemas['global_scores'])
+                        global_scores = await get_llm_response(clients['global_scores'], global_prompt, schemas['global_scores'])
                         if global_scores:
                             flat_scores = flatten_nested_dict(global_scores)
                             log_mi_global_eval({"pairing_id": pairing_id, "session_id": session_num, **flat_scores})
@@ -1381,7 +1668,7 @@ async def run_simulation(config=None):
                 # STAGE 3.1: SRS Survey
                 if current_stage_idx < SESSION_STAGES.index("srs_done"):
                     tqdm.write(f"Running SRS survey for session {session_num}...")
-                    success = generate_and_log_survey(clients['patient'], prompts['srs'], schemas['srs'], log_srs_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
+                    success = await generate_and_log_survey(clients['patient'], prompts['srs'], schemas['srs'], log_srs_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
                     if not success: tqdm.write(f"CRITICAL: Failed to generate SRS survey. Terminating."); exit()
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "srs_done")
                     current_stage_idx = SESSION_STAGES.index("srs_done")
@@ -1389,7 +1676,7 @@ async def run_simulation(config=None):
                 # STAGE 3.2: WAI Survey
                 if current_stage_idx < SESSION_STAGES.index("wai_done"):
                     tqdm.write(f"Running WAI survey for session {session_num}...")
-                    success = generate_and_log_survey(clients['patient'], prompts['wai'], schemas['wai'], log_wai_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
+                    success = await generate_and_log_survey(clients['patient'], prompts['wai'], schemas['wai'], log_wai_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
                     if not success: tqdm.write(f"CRITICAL: Failed to generate WAI survey. Terminating."); exit()
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "wai_done")
                     current_stage_idx = SESSION_STAGES.index("wai_done")
@@ -1421,7 +1708,7 @@ async def run_simulation(config=None):
                 else:
                     neq_prompt_to_use = prompts['neq']
 
-                success = generate_and_log_survey(
+                success = await generate_and_log_survey(
                     clients['patient'],
                     neq_prompt_to_use,
                     schemas['neq'],
@@ -1437,7 +1724,7 @@ async def run_simulation(config=None):
             # --- STAGE 4: After-session Report ---
             if current_stage_idx < SESSION_STAGES.index("report_done"):
                 current_report_prompt = prompts["report_material"] if therapist_config['api_type'] == 'psych_material' else prompts["report"]
-                report = generate_after_session_report(clients, persona_data, pairing_id, session_num, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, schemas['report'], current_report_prompt)
+                report = await generate_after_session_report(clients, persona_data, pairing_id, session_num, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, schemas['report'], current_report_prompt)
                 
                 if not report: 
                     tqdm.write("CRITICAL: Failed to generate after-session report. Terminating.")

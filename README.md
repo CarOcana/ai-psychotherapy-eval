@@ -153,6 +153,43 @@ The simulation runner executes the AI psychotherapy sessions and logs the data. 
     }
     ```
 
+    Inference calls are routed through a provider layer with configurable timeout and retries:
+    ```json
+    {
+      "inference": {
+        "timeout_s": 90,
+        "max_retries": 5,
+        "backoff_s": 5,
+        "backoff_multiplier": 2,
+        "temperature": 1
+      }
+    }
+    ```
+
+    With this default policy, failed LLM calls are retried with exponential backoff:
+    5s, 10s, 20s, and 40s between the five attempts.
+
+    Ollama models can be configured with the native Ollama API:
+    ```json
+    {
+      "models": {
+        "local_llama": {
+          "provider": "ollama",
+          "model": "llama3.1:8b",
+          "base_url": "http://localhost:11434",
+          "json_mode": "schema"
+        }
+      },
+      "therapists": {
+        "therapist_ollama_full": {
+          "api_type": "ollama",
+          "model_ref": "local_llama",
+          "prompt_file": "ai_therapist_prompt.txt"
+        }
+      }
+    }
+    ```
+
 6.  Deactivate the environment when done:
     ```bash
     deactivate
