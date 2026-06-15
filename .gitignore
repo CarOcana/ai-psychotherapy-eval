@@ -19,6 +19,7 @@ __pycache__/
 *.sqlite3
 */logs/
 run_simulation/runs/
+run_simulation/runs_dummy/
 
 # OS
 .DS_Store

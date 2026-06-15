@@ -227,7 +227,7 @@ def validate_runtime_config(config):
         if model_ref not in models:
             errors.append(f"therapist '{therapist_id}' references unknown model_ref '{model_ref}'")
         provider = therapist.get("provider") or therapist.get("api_type")
-        if provider not in {"characterai", "gemini", "openai", "ollama", "psych_material"}:
+        if provider not in {"characterai", "gemini", "openai", "ollama", "psych_material", "dummy"}:
             errors.append(f"therapist '{therapist_id}' has unsupported provider/api_type '{provider}'")
 
     pairings = config.get("pairings", {})
@@ -917,6 +917,145 @@ class StaticMaterialInferenceClient(InferenceClient):
             psych_material_progress[pairing_key] = current_index + 1
         return InferenceResult(text=text, provider=self.spec.provider, model=self.spec.model, attempts=1)
 
+def dummy_psych_state(value=3):
+    return {key: value for key in PSYCHOLOGICAL_CONSTRUCTS_KEYS}
+
+def dummy_from_schema(schema):
+    if "enum" in schema:
+        return schema["enum"][0]
+
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        return {
+            key: dummy_from_schema(child_schema)
+            for key, child_schema in schema.get("properties", {}).items()
+        }
+    if schema_type == "array":
+        return []
+    if schema_type == "integer":
+        return 3
+    if schema_type == "number":
+        return 5.0
+    if schema_type == "boolean":
+        return False
+    return "Dummy value"
+
+class DummyInferenceClient(InferenceClient):
+    async def generate(self, prompt, schema=None, context=None):
+        if schema:
+            parsed_json = self._dummy_json(schema)
+            validate_json_schema(parsed_json, schema)
+            return InferenceResult(
+                text=json.dumps(parsed_json),
+                json=parsed_json,
+                raw={"json": parsed_json},
+                provider=self.spec.provider,
+                model=self.spec.model,
+                attempts=1
+            )
+
+        return InferenceResult(
+            text=self._dummy_text(context or {}),
+            provider=self.spec.provider,
+            model=self.spec.model,
+            attempts=1
+        )
+
+    def _dummy_text(self, context):
+        return f"Dummy response from {self.role}."
+
+    def _dummy_json(self, schema):
+        properties = schema.get("properties", {})
+
+        if "chain_of_thought" in properties:
+            return {
+                "chain_of_thought": {
+                    "appraisal_internal_reflection": "Dummy appraisal for pipeline testing.",
+                    "state_update": dummy_psych_state(),
+                    "internal_justification": "Dummy state update for pipeline testing.",
+                    "selected_strategy": {
+                        "goal": "No active regulation required.",
+                        "strategy": "No Active Regulation",
+                        "tactic": "No Active Regulation"
+                    },
+                    "response_formulation": "This is a dummy patient response for pipeline testing.",
+                    "session_conclusion": False
+                }
+            }
+
+        if "classification" in properties:
+            return {"reasoning": "Dummy crisis evaluation.", "classification": "No Crisis"}
+
+        if "assess" in properties:
+            return {
+                "assess": False,
+                "de_escalate": False,
+                "recommend_emergency_services": False,
+                "request_human_consultation": False,
+                "overall_justification": "Dummy action-plan evaluation."
+            }
+
+        if "behavior_code_counts" in properties:
+            return {
+                "reasoning": "Dummy MITI behavior coding.",
+                "behavior_code_counts": {
+                    "GI": 1,
+                    "Persuade": 0,
+                    "Persuade with": 0,
+                    "Q": 1,
+                    "SR": 1,
+                    "CR": 1,
+                    "AF": 1,
+                    "Seek": 1,
+                    "Emphasize": 0,
+                    "Confront": 0
+                }
+            }
+
+        if {"cultivating_change_talk", "softening_sustain_talk", "partnership", "empathy"}.issubset(properties):
+            return {
+                key: {"score": 3, "reasoning": "Dummy global MI score."}
+                for key in ("cultivating_change_talk", "softening_sustain_talk", "partnership", "empathy")
+            }
+
+        if "adverse_event_selection" in properties:
+            return {
+                "adverse_event_selection": {
+                    event: {
+                        "occurred": False,
+                        "attribution": "N/A",
+                        "internal_justification": "Dummy adverse-event result."
+                    }
+                    for event in ADVERSE_EVENT_KEYS
+                },
+                "journal_summary": "Dummy between-session journal summary.",
+                "state_update": dummy_psych_state(),
+                "internal_justification": "Dummy after-session state update."
+            }
+
+        if "question_responses" in properties:
+            return {
+                "question_responses": [
+                    {
+                        "question_id": str(index),
+                        "question_text": f"Dummy NEQ question {index}.",
+                        "experienced": False,
+                        "severity": "N/A",
+                        "cause": "N/A"
+                    }
+                    for index in range(1, 33)
+                ],
+                "other_incidents_or_effects": "No dummy negative effects."
+            }
+
+        if {"relationship", "goals_and_topics", "approach_or_method", "overall"}.issubset(properties):
+            return {key: 5.0 for key in properties}
+
+        if "question36" in properties:
+            return {key: "Sometimes" for key in properties}
+
+        return dummy_from_schema(schema)
+
 def get_inference_policy():
     policy = deepcopy(DEFAULT_RUNTIME_CONFIG["inference"])
     policy.update(Config.RUNTIME_CONFIG.get("inference", {}))
@@ -983,6 +1122,8 @@ async def create_inference_client(model_ref, role, psych_material_snippets=None,
         return OpenAIInferenceClient(spec, policy, role, api_key)
     if spec.provider == "ollama":
         return OllamaInferenceClient(spec, policy, role)
+    if spec.provider == "dummy":
+        return DummyInferenceClient(spec, policy, role)
     if spec.provider == "characterai":
         if characterai_base_client is None:
             api_key = configured_api_key(Config.CHARACTERAI_API_KEY, spec.api_key_env)

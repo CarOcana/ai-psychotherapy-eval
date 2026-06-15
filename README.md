@@ -169,6 +169,21 @@ The simulation runner executes the AI psychotherapy sessions and logs the data. 
     With this default policy, failed LLM calls are retried with exponential backoff:
     5s, 10s, 20s, and 40s between the five attempts.
 
+    For cost-free pipeline tests, use the dummy provider. It returns deterministic
+    text and schema-valid JSON for each simulation role, so it can exercise runs,
+    pairings, checkpointing, CSV logs, prompt logs, and post-session stages without
+    calling any external LLM API. Dummy configs write to `run_simulation/runs_dummy/`
+    to avoid resuming or mixing with real runs:
+    ```bash
+    python simulation_runner.py --config configs/dummy_1s_8t.json
+    ```
+
+    A larger dummy configuration is also available for stress testing many generated
+    pairings:
+    ```bash
+    python simulation_runner.py --config configs/dummy_stress.json
+    ```
+
     Ollama models can be configured with the native Ollama API:
     ```json
     {
