@@ -1,0 +1,56 @@
+{
+  "run_name": "dummy_3m_2p_2s_8t",
+  "num_sessions": 2,
+  "num_turns_per_session": 8,
+  "paths": {
+    "runs_dir": "runs_dummy"
+  },
+  "models": {
+    "patient": {
+      "provider": "dummy",
+      "model": "dummy_patient"
+    },
+    "crisis": {
+      "provider": "dummy",
+      "model": "dummy_crisis"
+    },
+    "mi_behavior_code": {
+      "provider": "dummy",
+      "model": "dummy_mi_behavior"
+    },
+    "mi_global_score": {
+      "provider": "dummy",
+      "model": "dummy_mi_global"
+    },
+    "dummy_therapist": {
+      "provider": "dummy",
+      "model": "dummy_therapist"
+    }
+  },
+  "therapists": {
+    "therapist_dummy_limited": {
+      "api_type": "dummy",
+      "model_ref": "dummy_therapist",
+      "prompt_file": "limited_prompt.txt"
+    },
+    "therapist_dummy_full": {
+      "api_type": "dummy",
+      "model_ref": "dummy_therapist",
+      "prompt_file": "ai_therapist_prompt.txt"
+    },
+    "therapist_dummy_harm": {
+      "api_type": "dummy",
+      "model_ref": "dummy_therapist",
+      "prompt_file": "harmful_therapist_prompt.txt"
+    }
+  },
+  "pairings": {
+    "mode": "generated",
+    "patient_ids": [1,2],
+    "therapist_ids": [
+      "therapist_dummy_limited",
+      "therapist_dummy_full",
+      "therapist_dummy_harm"
+    ]
+  }
+}

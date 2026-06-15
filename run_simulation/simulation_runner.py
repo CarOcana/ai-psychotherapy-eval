@@ -5,13 +5,14 @@ import csv
 import json
 import time
 import re
+import sys
 from dataclasses import dataclass
 from copy import deepcopy
 import pandas as pd
 import requests
 from tqdm import tqdm
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
+from google import genai
+from google.genai import types
 from openai import OpenAI
 from PyCharacterAI import get_client
 
@@ -22,6 +23,24 @@ except ImportError:
         validate_json_schema_minimal(instance, schema)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+ANSI_COLORS = {
+    "cyan": "\033[36m",
+    "green": "\033[32m",
+    "magenta": "\033[35m",
+    "yellow": "\033[33m",
+    "red": "\033[31m",
+    "bold": "\033[1m",
+    "reset": "\033[0m",
+}
+
+def supports_color():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+def color_text(text, color):
+    if not supports_color():
+        return text
+    return f"{ANSI_COLORS.get(color, '')}{text}{ANSI_COLORS['reset']}"
 
 # --- CONFIGURATION ---
 class Config:
@@ -815,28 +834,54 @@ def parse_json_response(text):
         raise
 
 class GeminiInferenceClient(InferenceClient):
-    def __init__(self, spec, policy, role):
+    def __init__(self, spec, policy, role, api_key):
         super().__init__(spec, policy, role)
-        safety_settings = None
-        if spec.safety_settings:
-            safety_settings = {
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            }
-        self.client = genai.GenerativeModel(spec.model, safety_settings=safety_settings)
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=self.timeout_s * 1000,
+                retry_options=types.HttpRetryOptions(attempts=1)
+            )
+        )
+
+    def _safety_settings(self):
+        if not self.spec.safety_settings:
+            return None
+        return [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+        ]
+
+    def _generation_config(self, schema):
+        config_args = {
+            "temperature": self.temperature,
+            "safety_settings": self._safety_settings(),
+        }
+        if schema:
+            config_args["response_mime_type"] = "application/json"
+            config_args["response_json_schema"] = schema
+        return types.GenerateContentConfig(**config_args)
 
     async def _call_once(self, prompt, schema, context):
         def call():
-            config_args = {"temperature": self.temperature}
-            if schema:
-                config_args["response_mime_type"] = "application/json"
-                config_args["response_schema"] = schema
-            response = self.client.generate_content(
-                prompt,
-                generation_config=GenerationConfig(**config_args),
-                request_options={"timeout": self.timeout_s, "retry": None}
+            response = self.client.models.generate_content(
+                model=self.spec.model,
+                contents=prompt,
+                config=self._generation_config(schema)
             )
             return response.text
         return await asyncio.to_thread(call)
@@ -1113,8 +1158,7 @@ async def create_inference_client(model_ref, role, psych_material_snippets=None,
         api_key = configured_api_key(Config.GEMINI_API_KEY, spec.api_key_env)
         if not api_key:
             raise ValueError(f"{spec.api_key_env} is required for role '{role}'.")
-        genai.configure(api_key=api_key)
-        return GeminiInferenceClient(spec, policy, role)
+        return GeminiInferenceClient(spec, policy, role, api_key)
     if spec.provider == "openai":
         api_key = configured_api_key(Config.OPENAI_API_KEY, spec.api_key_env)
         if not api_key:
@@ -1529,6 +1573,54 @@ async def run_therapist_turn(clients, therapist_config, history, previous_sessio
         log_prompt_to_file(prompt, pairing_id, session_id, f"therapist_{therapist_config['client_key']}_turn_{turn_num}")
         return await get_llm_response(clients[therapist_config["therapist_id"]], prompt)
 
+def build_progress_indexes(pairings_df):
+    pairing_positions = {idx: pos + 1 for pos, idx in enumerate(pairings_df.index)}
+    therapist_ids = list(dict.fromkeys(pairings_df["therapist_id"].astype(str)))
+    therapist_positions = {therapist_id: pos + 1 for pos, therapist_id in enumerate(therapist_ids)}
+    return {
+        "total_pairings": len(pairings_df.index),
+        "total_therapists": len(therapist_ids),
+        "pairing_positions": pairing_positions,
+        "therapist_positions": therapist_positions,
+    }
+
+def build_progress_context(pairing_idx, pairing_info, pairing_id, persona_data, therapist_config, progress_indexes):
+    therapist_id = str(pairing_info["therapist_id"])
+    patient_id = str(pairing_info["patient_id"])
+    return {
+        "pairing_pos": progress_indexes["pairing_positions"][pairing_idx],
+        "total_pairings": progress_indexes["total_pairings"],
+        "patient_id": patient_id,
+        "patient_name": persona_data.get("name", patient_id),
+        "therapist_pos": progress_indexes["therapist_positions"][therapist_id],
+        "total_therapists": progress_indexes["total_therapists"],
+        "therapist_id": therapist_id,
+        "model": therapist_config["model"],
+        "pairing_id": pairing_id,
+    }
+
+def format_pairing_summary(progress_context):
+    pairing = color_text(f"[Pairing {progress_context['pairing_pos']}/{progress_context['total_pairings']}]", "cyan")
+    patient = color_text(
+        f"[Patient {progress_context['patient_id']}: {progress_context['patient_name']}]",
+        "green"
+    )
+    model = color_text(
+        f"[Model {progress_context['therapist_pos']}/{progress_context['total_therapists']}: "
+        f"{progress_context['therapist_id']} | {progress_context['model']}]",
+        "magenta"
+    )
+    return f"{pairing} {patient} {model}"
+
+def format_session_header(progress_context, session_num):
+    session = color_text(f"[Session {session_num}/{Config.NUM_SESSIONS}]", "yellow")
+    return f"{format_pairing_summary(progress_context)} {session}"
+
+def format_stage_message(progress_context, session_num, stage, message):
+    pairing = color_text(f"[P{progress_context['pairing_pos']}/{progress_context['total_pairings']}]", "cyan")
+    stage_label = color_text(f"[{stage}]", "magenta")
+    return f"{pairing}{stage_label} {message}"
+
 # --- MAIN SIMULATION ORCHESTRATOR ---
 async def run_simulation(config=None):
     if config is not None:
@@ -1571,13 +1663,15 @@ async def run_simulation(config=None):
     if start_pairing_idx >= len(pairings_df):
         print("Simulation was already complete. Exiting."); exit()
 
-    pbar_pairings = tqdm(pairings_df.index[start_pairing_idx:], desc="Pairings")
+    progress_indexes = build_progress_indexes(pairings_df)
+    pbar_pairings = tqdm(pairings_df.index[start_pairing_idx:], desc="Pairings", dynamic_ncols=True)
     for i in pbar_pairings:
         pairing_info = pairings_df.loc[i]
         pairing_id = int(pairing_info['pairing_id'])
         persona_data = personas_map[str(pairing_info['patient_id'])]
         therapist_config = therapists[pairing_info['therapist_id']]
-        pbar_pairings.set_postfix_str(f"Pairing {pairing_id} (Patient: {persona_data['name']}, Therapist: {therapist_config['model']})")
+        progress_context = build_progress_context(i, pairing_info, pairing_id, persona_data, therapist_config, progress_indexes)
+        pbar_pairings.set_postfix_str(format_pairing_summary(progress_context))
         
         is_resuming_pairing = (i == state['last_completed_pairing_idx'])
 
@@ -1598,6 +1692,7 @@ async def run_simulation(config=None):
                 start_session = state['last_completed_session']
 
         for session_num in range(start_session, Config.NUM_SESSIONS + 1):
+            tqdm.write(format_session_header(progress_context, session_num))
             is_resuming_session = (is_resuming_pairing and session_num == state['last_completed_session'])
             current_stage_idx = SESSION_STAGES.index(state['stage_completed']) if is_resuming_session else 0
 
@@ -1617,11 +1712,11 @@ async def run_simulation(config=None):
             
             # --- STAGE 1: Pre-session SURE Survey ---
             if current_stage_idx < SESSION_STAGES.index("sure_done"):
-                tqdm.write(f"Running pre-session survey for session {session_num}...")
+                tqdm.write(format_stage_message(progress_context, session_num, "SURE", "Running pre-session survey..."))
 
                 if pairing_info['therapist_id'] == 'therapist_psych_material':
                     sure_prompt_to_use = prompts['sure_material']
-                    tqdm.write("(Using material-specific SURE prompt)")
+                    tqdm.write(format_stage_message(progress_context, session_num, "SURE", "Using material-specific prompt."))
                 else:
                     sure_prompt_to_use = prompts['sure']
 
@@ -1672,7 +1767,12 @@ async def run_simulation(config=None):
                         history = [{"role": row['speaker'].capitalize(), "content": row['message']} for _, row in session_log.iterrows()]
                         tqdm.write(f"Reconstructed history with {len(history)} messages.")
 
-                pbar_turns = tqdm(range(start_turn, Config.NUM_TURNS_PER_SESSION + 1), desc=f"Session {session_num}", leave=False)
+                pbar_turns = tqdm(
+                    range(start_turn, Config.NUM_TURNS_PER_SESSION + 1),
+                    desc=f"Session {session_num}/{Config.NUM_SESSIONS}",
+                    leave=False,
+                    dynamic_ncols=True
+                )
                 therapist_response = history[-1]['content'] if history else ""
                 current_patient_prompt = prompts["patient_read"] if therapist_config['api_type'] == 'psych_material' else prompts["patient_turn"]
 
@@ -1779,7 +1879,7 @@ async def run_simulation(config=None):
             # They are skipped if the therapist is just psychoeducational material.
             if pairing_info['therapist_id'] != 'therapist_psych_material':
                 if current_stage_idx < SESSION_STAGES.index("mi_batch_behavior_done"):
-                    tqdm.write(f"Running MI Batch Behavior Coding for session {session_num}...")
+                    tqdm.write(format_stage_message(progress_context, session_num, "MI", "Running MI Batch Behavior Coding..."))
                     batch_prompt = prompts['mi_batch_behavior_eval'].format(current_session_transcript=current_session_transcript, miti_manual=miti_manual_text)
                     batch_codes = await get_llm_response(clients['batch_behavior_coding'], batch_prompt, schemas['batch_behavior_coding'])
                     log_data = calculate_and_prepare_mi_metrics(batch_codes, pairing_id, session_num)
@@ -1792,9 +1892,9 @@ async def run_simulation(config=None):
                     current_stage_idx = SESSION_STAGES.index("mi_batch_behavior_done")
 
                 if current_stage_idx < SESSION_STAGES.index("mi_global_done"):
-                    tqdm.write(f"Running MI Global evaluation for session {session_num}...")
+                    tqdm.write(format_stage_message(progress_context, session_num, "MI", "Running MI Global evaluation..."))
                     if clients.get('global_scores') is None:
-                        tqdm.write("Skipping MI Global evaluation because OPENAI_API_KEY is not configured.")
+                        tqdm.write(format_stage_message(progress_context, session_num, "MI", "Skipping MI Global evaluation because OPENAI_API_KEY is not configured."))
                     else:
                         global_prompt = prompts['mi_global_eval'].format(current_session_transcript=current_session_transcript, miti_manual=miti_manual_text)
                         global_scores = await get_llm_response(clients['global_scores'], global_prompt, schemas['global_scores'])
@@ -1808,7 +1908,7 @@ async def run_simulation(config=None):
 
                 # STAGE 3.1: SRS Survey
                 if current_stage_idx < SESSION_STAGES.index("srs_done"):
-                    tqdm.write(f"Running SRS survey for session {session_num}...")
+                    tqdm.write(format_stage_message(progress_context, session_num, "SRS", "Running SRS survey..."))
                     success = await generate_and_log_survey(clients['patient'], prompts['srs'], schemas['srs'], log_srs_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
                     if not success: tqdm.write(f"CRITICAL: Failed to generate SRS survey. Terminating."); exit()
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "srs_done")
@@ -1816,7 +1916,7 @@ async def run_simulation(config=None):
 
                 # STAGE 3.2: WAI Survey
                 if current_stage_idx < SESSION_STAGES.index("wai_done"):
-                    tqdm.write(f"Running WAI survey for session {session_num}...")
+                    tqdm.write(format_stage_message(progress_context, session_num, "WAI", "Running WAI survey..."))
                     success = await generate_and_log_survey(clients['patient'], prompts['wai'], schemas['wai'], log_wai_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
                     if not success: tqdm.write(f"CRITICAL: Failed to generate WAI survey. Terminating."); exit()
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "wai_done")
@@ -1825,7 +1925,7 @@ async def run_simulation(config=None):
             else:
                 # If the surveys are skipped, we must still update the state to prevent
                 # the simulation from getting stuck in an infinite loop on restart.
-                tqdm.write("Skipping SRS, WAI and MI surveys for 'therapist_psych_material'.")
+                tqdm.write(format_stage_message(progress_context, session_num, "SKIP", "Skipping SRS, WAI and MI surveys for 'therapist_psych_material'."))
                 if current_stage_idx < SESSION_STAGES.index("mi_batch_behavior_done"):
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "mi_batch_behavior_done")
                     current_stage_idx = SESSION_STAGES.index("mi_batch_behavior_done")
@@ -1841,11 +1941,11 @@ async def run_simulation(config=None):
 
             # STAGE 3.3: NEQ Survey (This is always run)
             if current_stage_idx < SESSION_STAGES.index("neq_done"):
-                tqdm.write(f"Running NEQ survey for session {session_num}...")
+                tqdm.write(format_stage_message(progress_context, session_num, "NEQ", "Running NEQ survey..."))
 
                 if pairing_info['therapist_id'] == 'therapist_psych_material':
                     neq_prompt_to_use = prompts['neq_material']
-                    tqdm.write("(Using material-specific NEQ prompt)")
+                    tqdm.write(format_stage_message(progress_context, session_num, "NEQ", "Using material-specific prompt."))
                 else:
                     neq_prompt_to_use = prompts['neq']
 
@@ -1864,6 +1964,7 @@ async def run_simulation(config=None):
 
             # --- STAGE 4: After-session Report ---
             if current_stage_idx < SESSION_STAGES.index("report_done"):
+                tqdm.write(format_stage_message(progress_context, session_num, "REPORT", "Generating after-session report..."))
                 current_report_prompt = prompts["report_material"] if therapist_config['api_type'] == 'psych_material' else prompts["report"]
                 report = await generate_after_session_report(clients, persona_data, pairing_id, session_num, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, schemas['report'], current_report_prompt)
                 
