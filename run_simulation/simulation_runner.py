@@ -213,15 +213,36 @@ def apply_cli_overrides(config, args):
         overrides["pairings"] = {"mode": "file", "file": os.path.abspath(args.pairings_file)}
     return deep_merge(config, overrides)
 
+def config_uses_dummy_provider(config):
+    for model_value in config.get("models", {}).values():
+        if isinstance(model_value, dict) and model_value.get("provider") == "dummy":
+            return True
+    for therapist in config.get("therapists", {}).values():
+        if (therapist.get("provider") or therapist.get("api_type")) == "dummy":
+            return True
+    return False
+
+def normalize_runs_dir(config, explicit_runs_dir=False):
+    resolved_config = deepcopy(config)
+    if not explicit_runs_dir:
+        resolved_config.setdefault("paths", {})["runs_dir"] = "runs_dummy" if config_uses_dummy_provider(resolved_config) else "runs"
+    return resolved_config
+
 def build_runtime_config(args=None):
     if args is None:
         args = parse_args()
     config = deepcopy(DEFAULT_RUNTIME_CONFIG)
+    explicit_runs_dir = False
     if args.preset:
-        config = deep_merge(config, load_preset(args.preset))
+        preset_config = load_preset(args.preset)
+        explicit_runs_dir = explicit_runs_dir or "runs_dir" in preset_config.get("paths", {})
+        config = deep_merge(config, preset_config)
     if args.config:
-        config = deep_merge(config, load_json_file(os.path.abspath(args.config)))
+        file_config = load_json_file(os.path.abspath(args.config))
+        explicit_runs_dir = explicit_runs_dir or "runs_dir" in file_config.get("paths", {})
+        config = deep_merge(config, file_config)
     config = apply_cli_overrides(config, args)
+    config = normalize_runs_dir(config, explicit_runs_dir=explicit_runs_dir)
     validate_runtime_config(config)
     return config
 
@@ -1196,6 +1217,12 @@ def get_required_model_refs(pairings_df, therapists):
 
     return required
 
+def uses_psych_material_therapist(pairings_df, therapists):
+    return any(
+        therapists[therapist_id]["provider"] == "psych_material"
+        for therapist_id in set(pairings_df["therapist_id"].astype(str))
+    )
+
 async def initialize_clients(pairings_df, therapists, psych_material_snippets):
     try:
         clients = {}
@@ -1614,7 +1641,7 @@ def format_pairing_summary(progress_context):
 
 def format_session_header(progress_context, session_num):
     session = color_text(f"[Session {session_num}/{Config.NUM_SESSIONS}]", "yellow")
-    return f"{format_pairing_summary(progress_context)} {session}"
+    return f"\n{format_pairing_summary(progress_context)} {session}"
 
 def format_stage_message(progress_context, session_num, stage, message):
     pairing = color_text(f"[P{progress_context['pairing_pos']}/{progress_context['total_pairings']}]", "cyan")
@@ -1644,12 +1671,14 @@ async def run_simulation(config=None):
         "mi_global_eval": load_prompt("global_scores_prompt.txt")
     }
     miti_manual_text = load_prompt("miti4_2.txt") # Add the MITI 4.2 coding manual as a .txt file to the prompts folder: https://motivationalinterviewing.org/sites/default/files/miti4_2.pdf
-    psych_edu_path = os.path.join(Config.PROMPT_DIR, "psych_edu_prompt.txt")
-    psych_material_snippets = load_and_split_psych_material(psych_edu_path, Config.NUM_SESSIONS * Config.NUM_TURNS_PER_SESSION)
     personas_df = pd.read_csv(Config.PATIENT_PERSONAS_FILE).astype(str)
     personas_map = {p['patient_id']: p for p in personas_df.to_dict('records')}
     pairings_df = load_pairings(personas_df)
     therapists = build_therapists()
+    psych_material_snippets = []
+    if uses_psych_material_therapist(pairings_df, therapists):
+        psych_edu_path = os.path.join(Config.PROMPT_DIR, "psych_edu_prompt.txt")
+        psych_material_snippets = load_and_split_psych_material(psych_edu_path, Config.NUM_SESSIONS * Config.NUM_TURNS_PER_SESSION)
     clients = await initialize_clients(pairings_df, therapists, psych_material_snippets)
 
     global characterai_chats, psych_material_progress
@@ -1664,7 +1693,7 @@ async def run_simulation(config=None):
         print("Simulation was already complete. Exiting."); exit()
 
     progress_indexes = build_progress_indexes(pairings_df)
-    pbar_pairings = tqdm(pairings_df.index[start_pairing_idx:], desc="Pairings", dynamic_ncols=True)
+    pbar_pairings = tqdm(pairings_df.index[start_pairing_idx:], desc="Pairings", dynamic_ncols=True, leave=False)
     for i in pbar_pairings:
         pairing_info = pairings_df.loc[i]
         pairing_id = int(pairing_info['pairing_id'])

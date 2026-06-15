@@ -172,8 +172,10 @@ The simulation runner executes the AI psychotherapy sessions and logs the data. 
     For cost-free pipeline tests, use the dummy provider. It returns deterministic
     text and schema-valid JSON for each simulation role, so it can exercise runs,
     pairings, checkpointing, CSV logs, prompt logs, and post-session stages without
-    calling any external LLM API. Dummy configs write to `run_simulation/runs_dummy/`
-    to avoid resuming or mixing with real runs:
+    calling any external LLM API. If a config does not explicitly set
+    `paths.runs_dir`, runs that include any dummy provider are written to
+    `run_simulation/runs_dummy/`; all non-dummy executions, including local
+    Ollama runs and mixed local/proprietary runs, are written to `run_simulation/runs/`.
     ```bash
     python simulation_runner.py --config configs/dummy_1s_8t.json
     ```
