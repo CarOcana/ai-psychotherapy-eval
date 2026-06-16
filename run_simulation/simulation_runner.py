@@ -654,6 +654,17 @@ def flatten_nested_dict(d, parent_key='', sep='_'):
             items.append((new_key, v))
     return dict(items)
 
+def normalize_neq_question_id(question_id):
+    if question_id is None:
+        return None
+    match = re.search(r"(\d+)$", str(question_id).strip())
+    if not match:
+        return None
+    normalized_id = int(match.group(1))
+    if normalized_id < 1 or normalized_id > 32:
+        return None
+    return str(normalized_id)
+
 def flatten_neq_response(response_dict):
     """
     Flattens the new NEQ survey JSON response (with a 'question_responses' array)
@@ -664,7 +675,7 @@ def flatten_neq_response(response_dict):
     # Process the array of question responses
     if 'question_responses' in response_dict and isinstance(response_dict['question_responses'], list):
         for response in response_dict['question_responses']:
-            q_id = response.get("question_id")
+            q_id = normalize_neq_question_id(response.get("question_id"))
             if q_id:
                 flat_dict[f"question{q_id}_experienced"] = response.get("experienced")
                 flat_dict[f"question{q_id}_severity"] = response.get("severity")
@@ -854,6 +865,24 @@ def parse_json_response(text):
             return json.loads(match.group(0))
         raise
 
+def extract_gemini_text(response):
+    if (
+        not response
+        or not response.candidates
+        or not response.candidates[0].content
+        or not response.candidates[0].content.parts
+    ):
+        return None
+
+    text_parts = []
+    for part in response.candidates[0].content.parts:
+        if getattr(part, "thought", False):
+            continue
+        text = getattr(part, "text", None)
+        if isinstance(text, str):
+            text_parts.append(text)
+    return "".join(text_parts) if text_parts else None
+
 class GeminiInferenceClient(InferenceClient):
     def __init__(self, spec, policy, role, api_key):
         super().__init__(spec, policy, role)
@@ -904,7 +933,7 @@ class GeminiInferenceClient(InferenceClient):
                 contents=prompt,
                 config=self._generation_config(schema)
             )
-            return response.text
+            return extract_gemini_text(response)
         return await asyncio.to_thread(call)
 
 class OpenAIInferenceClient(InferenceClient):
