@@ -1,24 +1,16 @@
 {
-    "run_name": "ollama_dummy_1s_2t",
+    "run_name": "ollama_test_gemini_2s_8t",
     "num_sessions": 1,
     "num_turns_per_session": 2,
     "models": {
-        "patient": {
-            "provider": "dummy",
-            "model": "dummy_patient"
-        },
-        "crisis": {
-            "provider": "dummy",
-            "model": "dummy_crisis"
-        },
-        "mi_behavior_code": {
-            "provider": "dummy",
-            "model": "dummy_mi_behavior"
-        },
+        "patient": "gemini-3.5-flash",
+        "character_ai": "psychologist-blazeman98",
         "mi_global_score": {
-            "provider": "dummy",
-            "model": "dummy_mi_global"
+            "provider": "gemini",
+            "model": "gemini-3.5-flash"
         },
+        "mi_behavior_code": "gemini-3.5-flash",
+        "crisis": "gemini-3.5-flash",
         "local_qwen": {
             "provider": "ollama",
             "model": "qwen2.5:0.5b",
@@ -29,7 +21,7 @@
         }
     },
     "therapists": {
-        "therapist_ollama_smoke": {
+        "therapist_ollama": {
             "api_type": "ollama",
             "model_ref": "local_qwen",
             "prompt_file": "ai_therapist_prompt.txt"
@@ -41,7 +33,7 @@
             1
         ],
         "therapist_ids": [
-            "therapist_ollama_smoke"
+            "therapist_ollama"
         ]
     }
 }

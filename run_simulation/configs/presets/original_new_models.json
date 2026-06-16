@@ -1,5 +1,5 @@
 {
-  "run_name": "original",
+  "run_name": "original_new_models",
   "num_sessions": 4,
   "num_turns_per_session": 48,
   "paths": {
@@ -17,17 +17,17 @@
     "temperature": 1
   },
   "models": {
-    "patient": "gemini-2.5-pro",
+    "patient": "gemini-3.5-flash",
     "gpt": "gpt-5-chat-latest",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.1-flash-lite",
     "character_ai": "psychologist-blazeman98",
     "psych_material": "rethinking-drinking-psych-material",
     "mi_global_score": {
-      "provider": "openai",
-      "model": "gpt-4o-2024-08-06"
+      "provider": "gemini",
+      "model": "gemini-3.5-flash"
     },
-    "mi_behavior_code": "gemini-2.5-pro",
-    "crisis": "gemini-2.5-pro"
+    "mi_behavior_code": "gemini-3.5-flash",
+    "crisis": "gemini-3.5-flash"
   },
   "therapists": {
     "therapist_char": {

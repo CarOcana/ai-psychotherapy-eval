@@ -1,0 +1,47 @@
+{
+    "run_name": "ollama_test_gemini_2s_8t",
+    "num_sessions": 1,
+    "num_turns_per_session": 2,
+    "models": {
+        "patient": {
+            "provider": "dummy",
+            "model": "dummy_patient"
+        },
+        "crisis": {
+            "provider": "dummy",
+            "model": "dummy_crisis"
+        },
+        "mi_behavior_code": {
+            "provider": "dummy",
+            "model": "dummy_mi_behavior"
+        },
+        "mi_global_score": {
+            "provider": "dummy",
+            "model": "dummy_mi_global"
+        },
+        "local_qwen": {
+            "provider": "ollama",
+            "model": "qwen2.5:0.5b",
+            "base_url": "http://localhost:11434",
+            "json_mode": "json",
+            "timeout_s": 120,
+            "temperature": 0.2
+        }
+    },
+    "therapists": {
+        "therapist_ollama_smoke": {
+            "api_type": "ollama",
+            "model_ref": "local_qwen",
+            "prompt_file": "ai_therapist_prompt.txt"
+        }
+    },
+    "pairings": {
+        "mode": "generated",
+        "patient_ids": [
+            1
+        ],
+        "therapist_ids": [
+            "therapist_ollama_smoke"
+        ]
+    }
+}
