@@ -87,9 +87,15 @@ class Config:
     RUN_ID = None
     PAIRINGS_CONFIG = {"mode": "file", "file": PAIRINGS_FILE}
     THERAPISTS_CONFIG = {}
+    LANGUAGE = "en"
+    LOCALE_DIR = None
+    CANONICAL_JSON_SCHEMA_DIR = os.path.join(SCRIPT_DIR, "json_schemas")
+    LOCALIZATION_MANIFEST = {}
+    SCHEMA_MAPPINGS = {}
 
 DEFAULT_RUNTIME_CONFIG = {
     "run_name": "original",
+    "language": "en",
     "num_sessions": 4,
     "num_turns_per_session": 48,
     "paths": {
@@ -192,6 +198,7 @@ def parse_args():
     parser.add_argument("--num-turns", type=int, help="Number of turns per session.")
     parser.add_argument("--pairings-file", help="CSV file with pairing_id, therapist_id, patient_id.")
     parser.add_argument("--personas-file", help="CSV file with patient personas.")
+    parser.add_argument("--language", choices=["en", "es"], help="Benchmark language to use.")
     return parser.parse_args()
 
 def resolve_path(path):
@@ -201,6 +208,8 @@ def resolve_path(path):
 
 def apply_cli_overrides(config, args):
     overrides = {}
+    if args.language:
+        overrides["language"] = args.language
     if args.run_name:
         overrides["run_name"] = args.run_name
     if args.num_sessions is not None:
@@ -228,6 +237,28 @@ def normalize_runs_dir(config, explicit_runs_dir=False):
         resolved_config.setdefault("paths", {})["runs_dir"] = "runs_dummy" if config_uses_dummy_provider(resolved_config) else "runs"
     return resolved_config
 
+def get_locale_dir(language):
+    return os.path.join(SCRIPT_DIR, "locales", language)
+
+def normalize_language_paths(config):
+    resolved_config = deepcopy(config)
+    language = resolved_config.get("language", "en")
+    if language == "es":
+        locale_dir = get_locale_dir(language)
+        paths = resolved_config.setdefault("paths", {})
+        paths["prompt_dir"] = os.path.join("locales", language, "prompts")
+        paths["json_schema_dir"] = os.path.join("locales", language, "json_schemas")
+        paths["personas_file"] = os.path.join("locales", language, "patient_personas.csv")
+        resolved_config["locale"] = {
+            "dir": locale_dir,
+            "manifest": os.path.join(locale_dir, "manifest.json"),
+            "schema_mappings": os.path.join(locale_dir, "schema_mappings.json")
+        }
+    else:
+        resolved_config["language"] = "en"
+        resolved_config["locale"] = None
+    return resolved_config
+
 def build_runtime_config(args=None):
     if args is None:
         args = parse_args()
@@ -242,12 +273,15 @@ def build_runtime_config(args=None):
         explicit_runs_dir = explicit_runs_dir or "runs_dir" in file_config.get("paths", {})
         config = deep_merge(config, file_config)
     config = apply_cli_overrides(config, args)
+    config = normalize_language_paths(config)
     config = normalize_runs_dir(config, explicit_runs_dir=explicit_runs_dir)
     validate_runtime_config(config)
     return config
 
 def validate_runtime_config(config):
     errors = []
+    if config.get("language", "en") not in {"en", "es"}:
+        errors.append("language must be 'en' or 'es'")
     if int(config.get("num_sessions", 0)) < 1:
         errors.append("num_sessions must be >= 1")
     if int(config.get("num_turns_per_session", 0)) < 1:
@@ -289,9 +323,21 @@ def validate_runtime_config(config):
         raise ValueError("Invalid runtime configuration:\n- " + "\n- ".join(errors))
 
 def refresh_schema_paths_and_headers():
-    global SCHEMA_PATHS, SURE_LOG_HEADERS, SRS_LOG_HEADERS, WAI_LOG_HEADERS
+    global SCHEMA_PATHS, CANONICAL_SCHEMA_PATHS, SURE_LOG_HEADERS, SRS_LOG_HEADERS, WAI_LOG_HEADERS
     global CRISIS_EVAL_LOG_HEADERS, ACTION_PLAN_EVAL_LOG_HEADERS, MI_GLOBAL_EVAL_LOG_HEADERS
 
+    CANONICAL_SCHEMA_PATHS = {
+        "patient": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "patient_schema.json"),
+        "report": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "after_session_report_schema.json"),
+        "sure": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "survey_sure_schema.json"),
+        "srs": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "survey_srs_schema.json"),
+        "wai": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "survey_wai_schema.json"),
+        "neq": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "survey_neq_schema.json"),
+        "crisis": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "crisis_schema.json"),
+        "action_plan": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "action_plan_schema.json"),
+        "batch_behavior_coding": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "mi_batch_behavior_schema.json"),
+        "global_scores": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "global_scores_schema.json")
+    }
     SCHEMA_PATHS = {
         "patient": os.path.join(Config.JSON_SCHEMA_DIR, "patient_schema.json"),
         "report": os.path.join(Config.JSON_SCHEMA_DIR, "after_session_report_schema.json"),
@@ -304,12 +350,20 @@ def refresh_schema_paths_and_headers():
         "batch_behavior_coding": os.path.join(Config.JSON_SCHEMA_DIR, "mi_batch_behavior_schema.json"),
         "global_scores": os.path.join(Config.JSON_SCHEMA_DIR, "global_scores_schema.json")
     }
-    SURE_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["sure"])
-    SRS_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["srs"])
-    WAI_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["wai"])
-    CRISIS_EVAL_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["crisis"], base_keys=["pairing_id", "session_id", "turn"])
-    ACTION_PLAN_EVAL_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["action_plan"], base_keys=["pairing_id", "session_id", "turn"])
-    MI_GLOBAL_EVAL_LOG_HEADERS = get_headers_from_schema(SCHEMA_PATHS["global_scores"])
+    SURE_LOG_HEADERS = get_headers_from_schema(CANONICAL_SCHEMA_PATHS["sure"])
+    SRS_LOG_HEADERS = get_headers_from_schema(CANONICAL_SCHEMA_PATHS["srs"])
+    WAI_LOG_HEADERS = get_headers_from_schema(CANONICAL_SCHEMA_PATHS["wai"])
+    CRISIS_EVAL_LOG_HEADERS = get_headers_from_schema(CANONICAL_SCHEMA_PATHS["crisis"], base_keys=["pairing_id", "session_id", "turn"])
+    ACTION_PLAN_EVAL_LOG_HEADERS = get_headers_from_schema(CANONICAL_SCHEMA_PATHS["action_plan"], base_keys=["pairing_id", "session_id", "turn"])
+    MI_GLOBAL_EVAL_LOG_HEADERS = get_headers_from_schema(CANONICAL_SCHEMA_PATHS["global_scores"])
+
+def load_localization_metadata(config):
+    locale = config.get("locale")
+    if not locale:
+        return {}, {}
+    manifest = load_json_file(locale["manifest"])
+    schema_mappings = load_json_file(locale["schema_mappings"])
+    return manifest, schema_mappings
 
 def normalize_model_name(model_value):
     if isinstance(model_value, dict):
@@ -321,9 +375,13 @@ def apply_runtime_config(config):
     models = config["models"]
 
     Config.RUNTIME_CONFIG = config
+    Config.LANGUAGE = config.get("language", "en")
+    Config.LOCALE_DIR = config.get("locale", {}).get("dir") if config.get("locale") else None
     Config.PATIENT_PERSONAS_FILE = resolve_path(paths["personas_file"])
     Config.PROMPT_DIR = resolve_path(paths["prompt_dir"])
     Config.JSON_SCHEMA_DIR = resolve_path(paths["json_schema_dir"])
+    Config.CANONICAL_JSON_SCHEMA_DIR = os.path.join(SCRIPT_DIR, "json_schemas")
+    Config.LOCALIZATION_MANIFEST, Config.SCHEMA_MAPPINGS = load_localization_metadata(config)
     Config.RUNS_DIR = resolve_path(paths["runs_dir"])
     Config.RUN_DIR = resolve_path(paths.get("run_dir", paths.get("log_dir", "logs")))
     Config.RUN_ID = config.get("run_id")
@@ -363,6 +421,13 @@ def apply_runtime_config(config):
 def write_resolved_config():
     if not Config.RUNTIME_CONFIG:
         return
+    if Config.LOCALIZATION_MANIFEST:
+        Config.RUNTIME_CONFIG["translation_status"] = {
+            "language": Config.LANGUAGE,
+            "manifest_status": Config.LOCALIZATION_MANIFEST.get("status"),
+            "translated_files": Config.LOCALIZATION_MANIFEST.get("translated_files", []),
+            "pending_translation_files": Config.LOCALIZATION_MANIFEST.get("pending_translation_files", [])
+        }
     path = os.path.join(Config.LOG_DIR, "run_config_resolved.json")
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(Config.RUNTIME_CONFIG, f, indent=2)
@@ -511,7 +576,7 @@ def get_headers_from_schema(schema_path, base_keys=None):
     if base_keys is None:
         base_keys = ["pairing_id", "session_id"]
     headers = list(base_keys)
-    with open(schema_path, 'r') as f:
+    with open(schema_path, 'r', encoding='utf-8') as f:
         schema = json.load(f)
     for key, value in schema['properties'].items():
         if value.get('type') == 'object' and 'properties' in value:
@@ -533,6 +598,19 @@ SCHEMA_PATHS = {
     "action_plan": os.path.join(Config.JSON_SCHEMA_DIR, "action_plan_schema.json"),
     "batch_behavior_coding": os.path.join(Config.JSON_SCHEMA_DIR, "mi_batch_behavior_schema.json"),
     "global_scores": os.path.join(Config.JSON_SCHEMA_DIR, "global_scores_schema.json")
+}
+
+CANONICAL_SCHEMA_PATHS = {
+    "patient": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "patient_schema.json"),
+    "report": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "after_session_report_schema.json"),
+    "sure": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "survey_sure_schema.json"),
+    "srs": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "survey_srs_schema.json"),
+    "wai": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "survey_wai_schema.json"),
+    "neq": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "survey_neq_schema.json"),
+    "crisis": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "crisis_schema.json"),
+    "action_plan": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "action_plan_schema.json"),
+    "batch_behavior_coding": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "mi_batch_behavior_schema.json"),
+    "global_scores": os.path.join(Config.CANONICAL_JSON_SCHEMA_DIR, "global_scores_schema.json")
 }
 
 PSYCHOLOGICAL_CONSTRUCTS_KEYS = [
@@ -767,6 +845,13 @@ class InferenceResult:
     attempts: int = 0
 
 @dataclass
+class LocalizedSchema:
+    name: str
+    model_schema: dict
+    canonical_schema: dict
+    mapping: dict
+
+@dataclass
 class ModelSpec:
     name: str
     provider: str
@@ -781,6 +866,94 @@ class ModelSpec:
     json_mode: str = "schema"
     character_id: str = None
     safety_settings: bool = True
+
+def is_localized_schema(schema):
+    return isinstance(schema, LocalizedSchema)
+
+def get_model_schema(schema):
+    return schema.model_schema if is_localized_schema(schema) else schema
+
+def get_canonical_schema(schema):
+    return schema.canonical_schema if is_localized_schema(schema) else schema
+
+def split_mapping_path(path):
+    return [segment for segment in str(path).split(".") if segment]
+
+def is_array_segment(segment):
+    return segment.endswith("[]")
+
+def segment_name(segment):
+    return segment[:-2] if is_array_segment(segment) else segment
+
+def rename_key_by_path(value, source_segments, target_segments):
+    if not source_segments:
+        return value
+    source = source_segments[0]
+    target = target_segments[0] if target_segments else source
+    source_key = segment_name(source)
+    target_key = segment_name(target)
+
+    if is_array_segment(source):
+        if not isinstance(value, dict) or source_key not in value or not isinstance(value[source_key], list):
+            return value
+        if source_key != target_key:
+            if target_key in value and target_key != source_key:
+                raise ValueError(f"Mapping collision for key '{target_key}'")
+            value[target_key] = value.pop(source_key)
+        for item in value[target_key]:
+            rename_key_by_path(item, source_segments[1:], target_segments[1:])
+        return value
+
+    if not isinstance(value, dict) or source_key not in value:
+        return value
+    if len(source_segments) == 1:
+        if source_key != target_key:
+            if target_key in value and target_key != source_key:
+                raise ValueError(f"Mapping collision for key '{target_key}'")
+            value[target_key] = value.pop(source_key)
+        return value
+    if source_key != target_key:
+        if target_key in value and target_key != source_key:
+            raise ValueError(f"Mapping collision for key '{target_key}'")
+        value[target_key] = value.pop(source_key)
+    rename_key_by_path(value[target_key], source_segments[1:], target_segments[1:])
+    return value
+
+def set_value_by_path(value, path_segments, converter):
+    if not path_segments:
+        return
+    segment = path_segments[0]
+    key = segment_name(segment)
+    if is_array_segment(segment):
+        if isinstance(value, dict) and isinstance(value.get(key), list):
+            for item in value[key]:
+                set_value_by_path(item, path_segments[1:], converter)
+        return
+    if not isinstance(value, dict) or key not in value:
+        return
+    if len(path_segments) == 1:
+        value[key] = converter(value[key])
+        return
+    set_value_by_path(value[key], path_segments[1:], converter)
+
+def apply_schema_mapping(response, mapping):
+    if not mapping:
+        return response
+    result = deepcopy(response)
+    for source_path, target_path in mapping.get("field_maps", {}).items():
+        rename_key_by_path(result, split_mapping_path(source_path), split_mapping_path(target_path))
+    for path, enum_map in mapping.get("enum_maps", {}).items():
+        def convert(item):
+            return enum_map.get(item, item)
+        set_value_by_path(result, split_mapping_path(path), convert)
+    return result
+
+def canonicalize_response_for_schema(response, schema):
+    if not is_localized_schema(schema):
+        return response
+    mapped_response = apply_schema_mapping(response, schema.mapping)
+    validate_json_schema(mapped_response, schema.canonical_schema)
+    return mapped_response
 
 class InferenceClient:
     def __init__(self, spec, policy, role):
@@ -811,9 +984,10 @@ class InferenceClient:
     async def generate(self, prompt, schema=None, context=None):
         delay = self.backoff_s
         last_error = None
+        model_schema = get_model_schema(schema)
         for attempt in range(1, self.max_retries + 1):
             try:
-                raw = await self._call_with_timeout(prompt, schema, context or {})
+                raw = await self._call_with_timeout(prompt, model_schema, context or {})
                 result = self._prepare_result(raw, schema, attempt)
                 return result
             except Exception as e:
@@ -843,8 +1017,10 @@ class InferenceClient:
         text = raw if isinstance(raw, str) else raw.get("text", "")
         parsed_json = None
         if schema:
+            model_schema = get_model_schema(schema)
             parsed_json = raw.get("json") if isinstance(raw, dict) and "json" in raw else parse_json_response(text)
-            validate_json_schema(parsed_json, schema)
+            validate_json_schema(parsed_json, model_schema)
+            parsed_json = canonicalize_response_for_schema(parsed_json, schema)
         return InferenceResult(
             text=text,
             json=parsed_json,
@@ -1038,8 +1214,10 @@ def dummy_from_schema(schema):
 class DummyInferenceClient(InferenceClient):
     async def generate(self, prompt, schema=None, context=None):
         if schema:
-            parsed_json = self._dummy_json(schema)
-            validate_json_schema(parsed_json, schema)
+            model_schema = get_model_schema(schema)
+            parsed_json = self._dummy_json(model_schema)
+            validate_json_schema(parsed_json, model_schema)
+            parsed_json = canonicalize_response_for_schema(parsed_json, schema)
             return InferenceResult(
                 text=json.dumps(parsed_json),
                 json=parsed_json,
@@ -1372,6 +1550,25 @@ def load_json_schema(filepath):
     except FileNotFoundError: print(f"Error: JSON schema not found at {filepath}"); exit()
     except json.JSONDecodeError: print(f"Error: Invalid JSON in schema file {filepath}"); exit()
 
+def get_schema_mapping(name):
+    return Config.SCHEMA_MAPPINGS.get("schemas", {}).get(name, {})
+
+def load_runtime_schemas():
+    schemas = {}
+    for name, path in SCHEMA_PATHS.items():
+        model_schema = load_json_schema(path)
+        if Config.LANGUAGE == "en":
+            schemas[name] = model_schema
+            continue
+        canonical_schema = load_json_schema(CANONICAL_SCHEMA_PATHS[name])
+        schemas[name] = LocalizedSchema(
+            name=name,
+            model_schema=model_schema,
+            canonical_schema=canonical_schema,
+            mapping=get_schema_mapping(name)
+        )
+    return schemas
+
 def build_therapists():
     therapists = {}
     for therapist_id, therapist_config in Config.THERAPISTS_CONFIG.items():
@@ -1688,7 +1885,7 @@ async def run_simulation(config=None):
     initialize_logs()
 
     # (This section is correct and remains the same - loading schemas, prompts, etc.)
-    schemas = {name: load_json_schema(path) for name, path in SCHEMA_PATHS.items()}
+    schemas = load_runtime_schemas()
     prompts = {
         "patient_turn": load_prompt("patient_turn_prompt.txt"), "patient_read": load_prompt("patient_read_prompt.txt"),
         "report": load_prompt("after_session_report_prompt.txt"), "report_material": load_prompt("after_session_report_material_prompt.txt"),

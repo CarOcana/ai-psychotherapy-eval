@@ -1,10 +1,9 @@
 {
     "run_name": "ollama_test_gemini_2s_8t",
-    "num_sessions": 1,
-    "num_turns_per_session": 2,
+    "num_sessions": 2,
+    "num_turns_per_session": 8,
     "models": {
         "patient": "gemini-3.5-flash",
-        "character_ai": "psychologist-blazeman98",
         "mi_global_score": {
             "provider": "gemini",
             "model": "gemini-3.5-flash"

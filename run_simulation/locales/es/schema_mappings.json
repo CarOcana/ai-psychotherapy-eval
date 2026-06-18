@@ -1,0 +1,57 @@
+{
+  "language": "es",
+  "canonical_language": "en",
+  "description": "Identity mappings for the untranslated Spanish scaffold. Replace field_maps and enum_maps as Spanish schemas are localized.",
+  "schemas": {
+    "patient": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder. Future Spanish field names for psychological constructs and regulation strategies must map to canonical keys."
+    },
+    "report": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder. Future Spanish adverse-event keys and attribution values must map to canonical keys."
+    },
+    "sure": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder. Future Spanish response options must map to canonical ordinal values if internal logs remain canonical."
+    },
+    "srs": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder."
+    },
+    "wai": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder."
+    },
+    "neq": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder. Future Spanish severity and cause values must map before flattening NEQ responses."
+    },
+    "crisis": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder. Future Spanish crisis categories must map to canonical categories used by action-plan branching."
+    },
+    "action_plan": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder. Future Spanish boolean step names must map to canonical action-plan fields."
+    },
+    "batch_behavior_coding": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder. MITI behavior codes may remain canonical if documented as official rubric codes."
+    },
+    "global_scores": {
+      "field_maps": {},
+      "enum_maps": {},
+      "notes": "Identity placeholder. Future Spanish global score dimensions must map to canonical MITI dimensions."
+    }
+  }
+}
