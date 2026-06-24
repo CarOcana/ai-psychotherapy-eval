@@ -2079,6 +2079,7 @@ async def run_simulation(config=None):
 
             # --- STAGE 2: Conversational Turns ---
             if current_stage_idx < SESSION_STAGES.index("turns_done"):
+                progress_write(format_stage_message(progress_context, session_num, "TURNS", "Running conversational turns..."))
                 # Determine where to start this session's turns from
                 start_turn = state['last_completed_turn'] + 1 if is_resuming_session and state['stage_completed'] == 'sure_done' else 1
                 # The last turn that was fully completed and saved in state.
@@ -2131,17 +2132,21 @@ async def run_simulation(config=None):
 
                 for turn_num in pbar_turns:
                     session_concluded_by_patient = False
+                    progress_write(format_stage_message(progress_context, session_num, "TURN", f"Starting turn {turn_num}/{Config.NUM_TURNS_PER_SESSION}..."))
 
                     # Patient's turn
                     if session_num == 1 and turn_num == 1 and not history:
+                        progress_write(format_stage_message(progress_context, session_num, "PATIENT", f"Using initial patient message for turn {turn_num}."))
                         patient_response = "I'm ready to start reading the material." if therapist_config['api_type'] == 'psych_material' else "I'd like to talk to you about my drinking."
                         history.append({"role": "Patient", "content": patient_response})
                         log_conversation_turn({"pairing_id": pairing_id, "session_id": session_num, "turn": turn_num, "speaker": "Patient", "message": patient_response, "session_conclusion": session_concluded_by_patient, **current_psych_state})
                     elif session_num != 1 and turn_num == 1 and not history:
+                        progress_write(format_stage_message(progress_context, session_num, "PATIENT", f"Using initial patient message for turn {turn_num}."))
                         patient_response = "I'm ready to start reading the material." if therapist_config['api_type'] == 'psych_material' else "Hi."
                         history.append({"role": "Patient", "content": patient_response})
                         log_conversation_turn({"pairing_id": pairing_id, "session_id": session_num, "turn": turn_num, "speaker": "Patient", "message": patient_response, "session_conclusion": session_concluded_by_patient, **current_psych_state})                        
                     else:
+                        progress_write(format_stage_message(progress_context, session_num, "PATIENT", f"Generating patient response for turn {turn_num}..."))
                         patient_output = await run_patient_turn(clients['patient'], persona_data, history, therapist_response, current_psych_state, schemas['patient'], previous_session_transcripts, patient_journaling_entries, current_patient_prompt, pairing_id, session_num, turn_num, pairing_info['therapist_id'])
                         if not patient_output:
                             fail_transient("CRITICAL: Patient turn failed. Terminating simulation.")
@@ -2152,6 +2157,7 @@ async def run_simulation(config=None):
                         log_conversation_turn({"pairing_id": pairing_id, "session_id": session_num, "turn": turn_num, "speaker": "Patient", "message": patient_response, "session_conclusion": session_concluded_by_patient, "appraisal_internal_reflection": cot['appraisal_internal_reflection'], "internal_justification": cot['internal_justification'], "goal": cot['selected_strategy']['goal'], "strategy": cot['selected_strategy']['strategy'], "tactic": cot['selected_strategy']['tactic'], **current_psych_state})
                     
                     # --- CRISIS EVALUATION ---
+                    progress_write(format_stage_message(progress_context, session_num, "CRISIS", f"Evaluating crisis risk for turn {turn_num}..."))
                     previous_messages_str = "No previous messages in this session."
                     if len(history) >= 3:
                         # history[-1] is the current patient message.
@@ -2173,6 +2179,7 @@ async def run_simulation(config=None):
                     log_crisis_eval({"pairing_id": pairing_id, "session_id": session_num, "turn": turn_num, **crisis_info})
 
                     # Therapist's turn
+                    progress_write(format_stage_message(progress_context, session_num, "THERAPIST", f"Generating therapist response for turn {turn_num}..."))
                     raw_therapist_response = await run_therapist_turn(clients, therapist_config, history, previous_session_transcripts, pairing_id, psych_material_snippets, session_num, turn_num)
                     
                     if not raw_therapist_response:
@@ -2201,6 +2208,7 @@ async def run_simulation(config=None):
                     
                     # --- ACTION PLAN EVALUATIONS ---
                     if crisis_info['classification'] != "No Crisis":
+                        progress_write(format_stage_message(progress_context, session_num, "ACTION", f"Evaluating action plan for turn {turn_num}..."))
                         action_plan_text = ACTION_PLAN_DEFINITIONS.get(crisis_info['classification'], "No specific action plan defined.")
                         transcript_for_action = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-2:]])
                         action_plan_prompt = prompts['action_plan_eval'].format(crisis_category=crisis_info['classification'], last_two_responses=transcript_for_action, action_plan_text=action_plan_text)
@@ -2212,6 +2220,7 @@ async def run_simulation(config=None):
 
                     # The turn is now fully complete. Save state.
                     save_state(i, session_num, turn_num, characterai_chats, psych_material_progress, SESSION_STAGES[current_stage_idx])
+                    progress_write(format_stage_message(progress_context, session_num, "TURN", f"Completed turn {turn_num}/{Config.NUM_TURNS_PER_SESSION}."))
 
                     if session_concluded_by_patient:
                         tqdm.write(f"Patient concluded session {session_num} early at turn {turn_num}.")
@@ -2228,7 +2237,7 @@ async def run_simulation(config=None):
             # They are skipped if the therapist is just psychoeducational material.
             if pairing_info['therapist_id'] != 'therapist_psych_material':
                 if current_stage_idx < SESSION_STAGES.index("mi_batch_behavior_done"):
-                    tqdm.write(format_stage_message(progress_context, session_num, "MI", "Running MI Batch Behavior Coding..."))
+                    progress_write(format_stage_message(progress_context, session_num, "MI", "Running MI Batch Behavior Coding..."))
                     batch_prompt = prompts['mi_batch_behavior_eval'].format(current_session_transcript=current_session_transcript, miti_manual=miti_manual_text)
                     batch_codes = await get_llm_response(clients['batch_behavior_coding'], batch_prompt, schemas['batch_behavior_coding'])
                     log_data = calculate_and_prepare_mi_metrics(batch_codes, pairing_id, session_num)
@@ -2241,9 +2250,9 @@ async def run_simulation(config=None):
                     current_stage_idx = SESSION_STAGES.index("mi_batch_behavior_done")
 
                 if current_stage_idx < SESSION_STAGES.index("mi_global_done"):
-                    tqdm.write(format_stage_message(progress_context, session_num, "MI", "Running MI Global evaluation..."))
+                    progress_write(format_stage_message(progress_context, session_num, "MI", "Running MI Global evaluation..."))
                     if clients.get('global_scores') is None:
-                        tqdm.write(format_stage_message(progress_context, session_num, "MI", "Skipping MI Global evaluation because OPENAI_API_KEY is not configured."))
+                        progress_write(format_stage_message(progress_context, session_num, "MI", "Skipping MI Global evaluation because OPENAI_API_KEY is not configured."))
                     else:
                         global_prompt = prompts['mi_global_eval'].format(current_session_transcript=current_session_transcript, miti_manual=miti_manual_text)
                         global_scores = await get_llm_response(clients['global_scores'], global_prompt, schemas['global_scores'])
@@ -2257,7 +2266,7 @@ async def run_simulation(config=None):
 
                 # STAGE 3.1: SRS Survey
                 if current_stage_idx < SESSION_STAGES.index("srs_done"):
-                    tqdm.write(format_stage_message(progress_context, session_num, "SRS", "Running SRS survey..."))
+                    progress_write(format_stage_message(progress_context, session_num, "SRS", "Running SRS survey..."))
                     success = await generate_and_log_survey(clients['patient'], prompts['srs'], schemas['srs'], log_srs_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
                     if not success: fail_transient("CRITICAL: Failed to generate SRS survey. Terminating.")
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "srs_done")
@@ -2265,7 +2274,7 @@ async def run_simulation(config=None):
 
                 # STAGE 3.2: WAI Survey
                 if current_stage_idx < SESSION_STAGES.index("wai_done"):
-                    tqdm.write(format_stage_message(progress_context, session_num, "WAI", "Running WAI survey..."))
+                    progress_write(format_stage_message(progress_context, session_num, "WAI", "Running WAI survey..."))
                     success = await generate_and_log_survey(clients['patient'], prompts['wai'], schemas['wai'], log_wai_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
                     if not success: fail_transient("CRITICAL: Failed to generate WAI survey. Terminating.")
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "wai_done")
@@ -2274,7 +2283,7 @@ async def run_simulation(config=None):
             else:
                 # If the surveys are skipped, we must still update the state to prevent
                 # the simulation from getting stuck in an infinite loop on restart.
-                tqdm.write(format_stage_message(progress_context, session_num, "SKIP", "Skipping SRS, WAI and MI surveys for 'therapist_psych_material'."))
+                progress_write(format_stage_message(progress_context, session_num, "SKIP", "Skipping SRS, WAI and MI surveys for 'therapist_psych_material'."))
                 if current_stage_idx < SESSION_STAGES.index("mi_batch_behavior_done"):
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "mi_batch_behavior_done")
                     current_stage_idx = SESSION_STAGES.index("mi_batch_behavior_done")
@@ -2290,11 +2299,11 @@ async def run_simulation(config=None):
 
             # STAGE 3.3: NEQ Survey (This is always run)
             if current_stage_idx < SESSION_STAGES.index("neq_done"):
-                tqdm.write(format_stage_message(progress_context, session_num, "NEQ", "Running NEQ survey..."))
+                progress_write(format_stage_message(progress_context, session_num, "NEQ", "Running NEQ survey..."))
 
                 if pairing_info['therapist_id'] == 'therapist_psych_material':
                     neq_prompt_to_use = prompts['neq_material']
-                    tqdm.write(format_stage_message(progress_context, session_num, "NEQ", "Using material-specific prompt."))
+                    progress_write(format_stage_message(progress_context, session_num, "NEQ", "Using material-specific prompt."))
                 else:
                     neq_prompt_to_use = prompts['neq']
 
@@ -2313,7 +2322,7 @@ async def run_simulation(config=None):
 
             # --- STAGE 4: After-session Report ---
             if current_stage_idx < SESSION_STAGES.index("report_done"):
-                tqdm.write(format_stage_message(progress_context, session_num, "REPORT", "Generating after-session report..."))
+                progress_write(format_stage_message(progress_context, session_num, "REPORT", "Generating after-session report..."))
                 current_report_prompt = prompts["report_material"] if therapist_config['api_type'] == 'psych_material' else prompts["report"]
                 report = await generate_after_session_report(clients, persona_data, pairing_id, session_num, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, schemas['report'], current_report_prompt)
                 
