@@ -20,6 +20,7 @@ __pycache__/
 */logs/
 run_simulation/runs/
 run_simulation/runs_dummy/
+run_simulation/supervisor_logs/
 
 # OS
 .DS_Store

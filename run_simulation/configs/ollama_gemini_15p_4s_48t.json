@@ -1,7 +1,7 @@
 {
-    "run_name": "ollama_test_gemini_2s_8t",
-    "num_sessions": 2,
-    "num_turns_per_session": 8,
+    "run_name": "ollama_gemini_15p_4s_48t",
+    "num_sessions": 4,
+    "num_turns_per_session": 48,
     "inference": {
         "timeout_s": 180,
         "max_retries": 6,
@@ -10,6 +10,11 @@
         "max_backoff_s": 300,
         "backoff_jitter_s": 10,
         "temperature": 1
+    },
+    "watchdog": {
+        "enabled": true,
+        "no_progress_timeout_s": 3600,
+        "heartbeat_s": 300
     },
     "models": {
         "patient": "gemini-3.5-flash",
@@ -21,7 +26,7 @@
         "crisis": "gemini-3.5-flash",
         "local_qwen": {
             "provider": "ollama",
-            "model": "qwen3:8b",
+            "model": "qwen3:14b",
             "base_url": "http://localhost:11434",
             "json_mode": "json",
             "timeout_s": 120,
@@ -38,7 +43,7 @@
     "pairings": {
         "mode": "generated",
         "patient_ids": [
-            1
+            1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
         ],
         "therapist_ids": [
             "therapist_ollama"

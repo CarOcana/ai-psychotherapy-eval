@@ -21,7 +21,7 @@
         },
         "local_qwen": {
             "provider": "ollama",
-            "model": "qwen2.5:0.5b",
+            "model": "qwen3:8b",
             "base_url": "http://localhost:11434",
             "json_mode": "json",
             "timeout_s": 120,

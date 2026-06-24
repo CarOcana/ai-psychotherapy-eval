@@ -6,6 +6,8 @@ import json
 import time
 import re
 import sys
+import random
+import threading
 from dataclasses import dataclass
 from copy import deepcopy
 import pandas as pd
@@ -24,6 +26,62 @@ except ImportError:
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+EXIT_SUCCESS = 0
+EXIT_FATAL = 1
+EXIT_TRANSIENT = 2
+
+class FatalRunError(Exception):
+    """Non-recoverable setup or configuration failure."""
+
+class TransientRunFailure(Exception):
+    """Recoverable runtime failure; rerunning can resume from saved state."""
+
+def fail_fatal(message):
+    raise FatalRunError(message)
+
+def fail_transient(message):
+    raise TransientRunFailure(message)
+
+LAST_PROGRESS_TS = time.monotonic()
+LAST_PROGRESS_LABEL = "startup"
+WATCHDOG_STARTED = False
+
+def mark_progress(label):
+    global LAST_PROGRESS_TS, LAST_PROGRESS_LABEL
+    LAST_PROGRESS_TS = time.monotonic()
+    LAST_PROGRESS_LABEL = label
+
+def progress_write(message):
+    mark_progress(message)
+    tqdm.write(message)
+
+def start_progress_watchdog(config):
+    global WATCHDOG_STARTED
+    watchdog_config = config.get("watchdog", {})
+    if WATCHDOG_STARTED or not watchdog_config.get("enabled", True):
+        return
+
+    no_progress_timeout_s = int(watchdog_config.get("no_progress_timeout_s", 3600))
+    heartbeat_s = int(watchdog_config.get("heartbeat_s", 300))
+    if no_progress_timeout_s <= 0:
+        return
+
+    WATCHDOG_STARTED = True
+
+    def watch():
+        while True:
+            time.sleep(max(1, heartbeat_s))
+            idle_s = time.monotonic() - LAST_PROGRESS_TS
+            if idle_s >= no_progress_timeout_s:
+                print(
+                    f"CRITICAL: No progress for {int(idle_s)}s. "
+                    f"Last progress: {LAST_PROGRESS_LABEL}. Terminating for supervisor retry.",
+                    flush=True,
+                )
+                os._exit(EXIT_TRANSIENT)
+
+    threading.Thread(target=watch, daemon=True).start()
+
 ANSI_COLORS = {
     "cyan": "\033[36m",
     "green": "\033[32m",
@@ -35,7 +93,11 @@ ANSI_COLORS = {
 }
 
 def supports_color():
-    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("FORCE_COLOR") in {"1", "true", "TRUE", "yes", "YES"}:
+        return True
+    return sys.stdout.isatty()
 
 def color_text(text, color):
     if not supports_color():
@@ -110,7 +172,14 @@ DEFAULT_RUNTIME_CONFIG = {
         "max_retries": 5,
         "backoff_s": 5,
         "backoff_multiplier": 2,
+        "max_backoff_s": 300,
+        "backoff_jitter_s": 10,
         "temperature": 1
+    },
+    "watchdog": {
+        "enabled": True,
+        "no_progress_timeout_s": 3600,
+        "heartbeat_s": 300
     },
     "models": {
         "patient": "gemini-2.5-pro",
@@ -526,7 +595,7 @@ def prepare_runtime_config(args):
             resumed_config = load_resolved_run_config(explicit_run_dir)
             if is_run_complete(explicit_run_dir):
                 print(f"Simulation was already complete for run '{args.run_name}'. Exiting.")
-                exit()
+                sys.exit(EXIT_SUCCESS)
             print(f"Resuming explicitly requested run: {args.run_name}")
             return resumed_config
 
@@ -831,8 +900,7 @@ def load_and_split_psych_material(filepath, num_snippets):
         tqdm.write(f"Successfully loaded and split psychoeducation material into {len(snippets)} snippets.")
         return snippets[:num_snippets]
     except FileNotFoundError:
-        tqdm.write(f"ERROR: Psychoeducation file not found at {filepath}. This condition will fail.")
-        exit() # Terminate the script
+        fail_fatal(f"ERROR: Psychoeducation file not found at {filepath}. This condition will fail.")
 
 # --- INFERENCE LAYER ---
 @dataclass
@@ -978,6 +1046,14 @@ class InferenceClient:
         return self.spec.backoff_multiplier or self.policy["backoff_multiplier"]
 
     @property
+    def max_backoff_s(self):
+        return self.policy.get("max_backoff_s", 300)
+
+    @property
+    def backoff_jitter_s(self):
+        return self.policy.get("backoff_jitter_s", 0)
+
+    @property
     def temperature(self):
         return self.spec.temperature if self.spec.temperature is not None else self.policy["temperature"]
 
@@ -986,21 +1062,28 @@ class InferenceClient:
         last_error = None
         model_schema = get_model_schema(schema)
         for attempt in range(1, self.max_retries + 1):
+            mark_progress(
+                f"inference attempt {attempt}/{self.max_retries} "
+                f"role={self.role} provider={self.spec.provider} model={self.spec.model}"
+            )
             try:
                 raw = await self._call_with_timeout(prompt, model_schema, context or {})
                 result = self._prepare_result(raw, schema, attempt)
                 return result
             except Exception as e:
                 last_error = e
-                tqdm.write(
+                progress_write(
                     f"Inference failed for role={self.role}, provider={self.spec.provider}, "
                     f"model={self.spec.model}, attempt={attempt}/{self.max_retries}: {type(e).__name__}: {e}"
                 )
                 if attempt < self.max_retries:
-                    await asyncio.sleep(delay)
-                    delay *= self.backoff_multiplier
+                    sleep_s = min(delay, self.max_backoff_s)
+                    if self.backoff_jitter_s:
+                        sleep_s += random.uniform(0, self.backoff_jitter_s)
+                    await asyncio.sleep(sleep_s)
+                    delay = min(delay * self.backoff_multiplier, self.max_backoff_s)
 
-        tqdm.write(
+        progress_write(
             f"CRITICAL: Aborting LLM call after {self.max_retries} attempts "
             f"(role={self.role}, provider={self.spec.provider}, model={self.spec.model}). "
             f"Last error: {type(last_error).__name__}: {last_error}"
@@ -1472,7 +1555,7 @@ async def initialize_clients(pairings_df, therapists, psych_material_snippets):
         print("API clients initialized.")
         return clients
     except Exception as e:
-        print(f"Error initializing API clients: {e}"); exit()
+        fail_fatal(f"Error initializing API clients: {e}")
 
 # --- STATE MANAGEMENT ---
 def load_state():
@@ -1542,13 +1625,13 @@ def load_prompt(filename):
     path = os.path.join(Config.PROMPT_DIR, filename)
     try:
         with open(path, 'r', encoding='utf-8') as f: return f.read()
-    except FileNotFoundError: print(f"Error: Prompt file not found at {path}"); exit()
+    except FileNotFoundError: fail_fatal(f"Error: Prompt file not found at {path}")
 
 def load_json_schema(filepath):
     try:
         with open(filepath, 'r', encoding='utf-8') as f: return json.load(f)
-    except FileNotFoundError: print(f"Error: JSON schema not found at {filepath}"); exit()
-    except json.JSONDecodeError: print(f"Error: Invalid JSON in schema file {filepath}"); exit()
+    except FileNotFoundError: fail_fatal(f"Error: JSON schema not found at {filepath}")
+    except json.JSONDecodeError: fail_fatal(f"Error: Invalid JSON in schema file {filepath}")
 
 def get_schema_mapping(name):
     return Config.SCHEMA_MAPPINGS.get("schemas", {}).get(name, {})
@@ -1882,6 +1965,7 @@ async def run_simulation(config=None):
         default_config = deepcopy(DEFAULT_RUNTIME_CONFIG)
         default_run_dir = os.path.join(get_runs_dir(default_config), build_new_run_id(default_config))
         apply_runtime_config(attach_run_directory(default_config, default_run_dir))
+    start_progress_watchdog(Config.RUNTIME_CONFIG)
     initialize_logs()
 
     # (This section is correct and remains the same - loading schemas, prompts, etc.)
@@ -1916,7 +2000,8 @@ async def run_simulation(config=None):
         start_pairing_idx = state['last_completed_pairing_idx'] + 1 if is_pairing_finished else state['last_completed_pairing_idx']
 
     if start_pairing_idx >= len(pairings_df):
-        print("Simulation was already complete. Exiting."); exit()
+        print("Simulation was already complete. Exiting.")
+        sys.exit(EXIT_SUCCESS)
 
     progress_indexes = build_progress_indexes(pairings_df)
     pbar_pairings = tqdm(pairings_df.index[start_pairing_idx:], desc="Pairings", dynamic_ncols=True, leave=False)
@@ -1927,6 +2012,7 @@ async def run_simulation(config=None):
         therapist_config = therapists[pairing_info['therapist_id']]
         progress_context = build_progress_context(i, pairing_info, pairing_id, persona_data, therapist_config, progress_indexes)
         pbar_pairings.set_postfix_str(format_pairing_summary(progress_context))
+        progress_write(format_pairing_summary(progress_context))
         
         is_resuming_pairing = (i == state['last_completed_pairing_idx'])
 
@@ -1947,11 +2033,12 @@ async def run_simulation(config=None):
                 start_session = state['last_completed_session']
 
         for session_num in range(start_session, Config.NUM_SESSIONS + 1):
-            tqdm.write(format_session_header(progress_context, session_num))
+            progress_write(format_session_header(progress_context, session_num))
             is_resuming_session = (is_resuming_pairing and session_num == state['last_completed_session'])
             current_stage_idx = SESSION_STAGES.index(state['stage_completed']) if is_resuming_session else 0
 
             # (Load context logic remains the same and is correct)
+            progress_write(format_stage_message(progress_context, session_num, "CONTEXT", "Loading session context..."))
             if session_num == 1: current_psych_state = {key: int(persona_data[key]) for key in PSYCHOLOGICAL_CONSTRUCTS_KEYS}
             else:
                 try:
@@ -1964,10 +2051,11 @@ async def run_simulation(config=None):
 
             previous_session_transcripts = load_previous_session_transcripts(pairing_id, session_num, pairing_info['therapist_id'])
             patient_journaling_entries = load_journaling_entries(pairing_id, session_num)
+            progress_write(format_stage_message(progress_context, session_num, "CONTEXT", "Session context loaded."))
             
             # --- STAGE 1: Pre-session SURE Survey ---
             if current_stage_idx < SESSION_STAGES.index("sure_done"):
-                tqdm.write(format_stage_message(progress_context, session_num, "SURE", "Running pre-session survey..."))
+                progress_write(format_stage_message(progress_context, session_num, "SURE", "Running pre-session survey..."))
 
                 if pairing_info['therapist_id'] == 'therapist_psych_material':
                     sure_prompt_to_use = prompts['sure_material']
@@ -1984,7 +2072,7 @@ async def run_simulation(config=None):
                     patient_journaling_entries, "Session has not started yet.",
                     pairing_id, session_num
                 )
-                if not success: tqdm.write("CRITICAL: Failed to generate pre-session survey. Terminating."); exit()
+                if not success: fail_transient("CRITICAL: Failed to generate pre-session survey. Terminating.")
                 save_state(i, session_num, 0, characterai_chats, psych_material_progress, "sure_done")
                 current_stage_idx = SESSION_STAGES.index("sure_done")
 
@@ -1993,14 +2081,21 @@ async def run_simulation(config=None):
             if current_stage_idx < SESSION_STAGES.index("turns_done"):
                 # Determine where to start this session's turns from
                 start_turn = state['last_completed_turn'] + 1 if is_resuming_session and state['stage_completed'] == 'sure_done' else 1
+                # The last turn that was fully completed and saved in state.
+                last_good_turn = start_turn - 1
                 
-                if os.path.exists(Config.CONVERSATION_LOG_FILE):
+                turn_scoped_logs = [
+                    (Config.CONVERSATION_LOG_FILE, "conversation"),
+                    (Config.CRISIS_EVAL_LOG_FILE, "crisis evaluation"),
+                    (Config.ACTION_PLAN_EVAL_LOG_FILE, "action plan evaluation"),
+                ]
+                for log_path, log_label in turn_scoped_logs:
+                    if not os.path.exists(log_path):
+                        continue
                     try:
-                        log_df = pd.read_csv(Config.CONVERSATION_LOG_FILE)
-                        # The last turn that was fully completed (Patient + Therapist)
-                        last_good_turn = start_turn - 1
-                        
-                        # Find and remove any rows from the current session that are for turns AFTER the last completed one
+                        log_df = pd.read_csv(log_path)
+                        if not {"pairing_id", "session_id", "turn"}.issubset(log_df.columns):
+                            continue
                         rows_to_drop = log_df[
                             (log_df['pairing_id'] == pairing_id) & 
                             (log_df['session_id'] == session_num) & 
@@ -2009,10 +2104,13 @@ async def run_simulation(config=None):
                         
                         if not rows_to_drop.empty:
                             log_df_clean = log_df.drop(rows_to_drop)
-                            tqdm.write(f"Detected and removed {len(rows_to_drop)} incomplete log entries from a previous crash.")
-                            log_df_clean.to_csv(Config.CONVERSATION_LOG_FILE, index=False)
+                            tqdm.write(
+                                f"Detected and removed {len(rows_to_drop)} incomplete "
+                                f"{log_label} log entries from a previous crash."
+                            )
+                            log_df_clean.to_csv(log_path, index=False)
                     except Exception as e:
-                        tqdm.write(f"Warning: Could not read or clean log file: {e}")
+                        tqdm.write(f"Warning: Could not read or clean {log_label} log file: {e}")
 
                 history = []
                 if start_turn > 1: # Reconstruct history from the now-clean log
@@ -2046,8 +2144,7 @@ async def run_simulation(config=None):
                     else:
                         patient_output = await run_patient_turn(clients['patient'], persona_data, history, therapist_response, current_psych_state, schemas['patient'], previous_session_transcripts, patient_journaling_entries, current_patient_prompt, pairing_id, session_num, turn_num, pairing_info['therapist_id'])
                         if not patient_output:
-                            tqdm.write("CRITICAL: Patient turn failed. Terminating simulation.")
-                            exit()
+                            fail_transient("CRITICAL: Patient turn failed. Terminating simulation.")
                         cot = patient_output['chain_of_thought']
                         session_concluded_by_patient = cot.get("session_conclusion", False) 
                         patient_response, current_psych_state = sanitize_text(cot['response_formulation']), cot['state_update']
@@ -2072,16 +2169,14 @@ async def run_simulation(config=None):
                     crisis_info = await get_llm_response(clients['crisis'], crisis_prompt, schemas['crisis'])
                     
                     if not crisis_info:
-                        tqdm.write(f"CRITICAL: Crisis evaluation failed for turn {turn_num}. Terminating.")
-                        exit()
+                        fail_transient(f"CRITICAL: Crisis evaluation failed for turn {turn_num}. Terminating.")
                     log_crisis_eval({"pairing_id": pairing_id, "session_id": session_num, "turn": turn_num, **crisis_info})
 
                     # Therapist's turn
                     raw_therapist_response = await run_therapist_turn(clients, therapist_config, history, previous_session_transcripts, pairing_id, psych_material_snippets, session_num, turn_num)
                     
                     if not raw_therapist_response:
-                        tqdm.write(f"CRITICAL: Therapist model failed to generate a response for turn {turn_num}. Terminating.")
-                        exit()
+                        fail_transient(f"CRITICAL: Therapist model failed to generate a response for turn {turn_num}. Terminating.")
 
                     # Remove the specific prefix if it's present
                     prefix1 = "Therapist (Dr. Anderson):"
@@ -2112,8 +2207,7 @@ async def run_simulation(config=None):
                         log_prompt_to_file(action_plan_prompt, pairing_id, session_num, f"action_plan_eval_turn_{turn_num}")
                         action_plan_info = await get_llm_response(clients['crisis'], action_plan_prompt, schemas['action_plan'])
                         if not action_plan_info:
-                            tqdm.write(f"CRITICAL: Action plan evaluation failed for turn {turn_num}. Terminating.")
-                            exit()
+                            fail_transient(f"CRITICAL: Action plan evaluation failed for turn {turn_num}. Terminating.")
                         log_action_plan_eval({"pairing_id": pairing_id, "session_id": session_num, "turn": turn_num, **action_plan_info})
 
                     # The turn is now fully complete. Save state.
@@ -2141,7 +2235,7 @@ async def run_simulation(config=None):
                     if log_data:
                         log_mi_batch_behavior_eval(log_data)
                     else:
-                        tqdm.write(f"CRITICAL: Failed to generate MI Batch Behavior codes or response was malformed. Terminating."); exit()
+                        fail_transient("CRITICAL: Failed to generate MI Batch Behavior codes or response was malformed. Terminating.")
                     
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "mi_batch_behavior_done")
                     current_stage_idx = SESSION_STAGES.index("mi_batch_behavior_done")
@@ -2157,7 +2251,7 @@ async def run_simulation(config=None):
                             flat_scores = flatten_nested_dict(global_scores)
                             log_mi_global_eval({"pairing_id": pairing_id, "session_id": session_num, **flat_scores})
                         else:
-                            tqdm.write(f"CRITICAL: Failed to generate MI Global scores. Terminating."); exit()
+                            fail_transient("CRITICAL: Failed to generate MI Global scores. Terminating.")
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "mi_global_done")
                     current_stage_idx = SESSION_STAGES.index("mi_global_done")
 
@@ -2165,7 +2259,7 @@ async def run_simulation(config=None):
                 if current_stage_idx < SESSION_STAGES.index("srs_done"):
                     tqdm.write(format_stage_message(progress_context, session_num, "SRS", "Running SRS survey..."))
                     success = await generate_and_log_survey(clients['patient'], prompts['srs'], schemas['srs'], log_srs_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
-                    if not success: tqdm.write(f"CRITICAL: Failed to generate SRS survey. Terminating."); exit()
+                    if not success: fail_transient("CRITICAL: Failed to generate SRS survey. Terminating.")
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "srs_done")
                     current_stage_idx = SESSION_STAGES.index("srs_done")
 
@@ -2173,7 +2267,7 @@ async def run_simulation(config=None):
                 if current_stage_idx < SESSION_STAGES.index("wai_done"):
                     tqdm.write(format_stage_message(progress_context, session_num, "WAI", "Running WAI survey..."))
                     success = await generate_and_log_survey(clients['patient'], prompts['wai'], schemas['wai'], log_wai_survey, persona_data, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, pairing_id, session_num)
-                    if not success: tqdm.write(f"CRITICAL: Failed to generate WAI survey. Terminating."); exit()
+                    if not success: fail_transient("CRITICAL: Failed to generate WAI survey. Terminating.")
                     save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "wai_done")
                     current_stage_idx = SESSION_STAGES.index("wai_done")
             
@@ -2213,7 +2307,7 @@ async def run_simulation(config=None):
                     patient_journaling_entries, current_session_transcript,
                     pairing_id, session_num
                 )
-                if not success: tqdm.write(f"CRITICAL: Failed to generate NEQ survey. Terminating."); exit()
+                if not success: fail_transient("CRITICAL: Failed to generate NEQ survey. Terminating.")
                 save_state(i, session_num, Config.NUM_TURNS_PER_SESSION, characterai_chats, psych_material_progress, "neq_done")
                 current_stage_idx = SESSION_STAGES.index("neq_done")
 
@@ -2224,8 +2318,7 @@ async def run_simulation(config=None):
                 report = await generate_after_session_report(clients, persona_data, pairing_id, session_num, current_psych_state, previous_session_transcripts, patient_journaling_entries, current_session_transcript, schemas['report'], current_report_prompt)
                 
                 if not report: 
-                    tqdm.write("CRITICAL: Failed to generate after-session report. Terminating.")
-                    exit()
+                    fail_transient("CRITICAL: Failed to generate after-session report. Terminating.")
 
                 # Check for terminating conditions BEFORE saving the final state
                 adverse_events = report.get("adverse_event_selection", {})
@@ -2252,6 +2345,12 @@ if __name__ == "__main__":
         load_environment()
         runtime_config = prepare_runtime_config(parse_args())
         asyncio.run(run_simulation(runtime_config))
-    except ValueError as e:
+    except TransientRunFailure as e:
         print(e)
-        exit(1)
+        sys.exit(EXIT_TRANSIENT)
+    except (FatalRunError, ValueError) as e:
+        print(e)
+        sys.exit(EXIT_FATAL)
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+        sys.exit(130)
